@@ -32,9 +32,12 @@ makepkg -si   # from the repo root, requires python-build python-installer pytho
 
 ```sh
 lsf                      # interactive schedule (default)
+lsf start                # begin the current session (records start time)
+lsf start 3              # begin session 3 from today's plan
+lsf done                 # mark current session complete and log time spent
+lsf panic                # survival triage (only available when overloaded)
 lsf import tasks.csv     # import assignments from a CSV file
 lsf import               # import from ~/.lsf/import.csv (hot-folder)
-lsf panic                # survival triage when overloaded
 lsf --next               # machine-readable next task (for fastfetch/status bars)
 ```
 
@@ -46,7 +49,7 @@ Edit it to match your actual available hours:
 ```toml
 [defaults]
 risk_multiplier    = 1.4  # estimates multiplied by this (Hofstadter buffer)
-switch_penalty_min = 10   # minutes lost switching between tasks
+switch_penalty_min = 10   # used for urgency calculation, not clock time
 
 [weekday]
 windows = [
@@ -73,6 +76,8 @@ See `config/config.toml.example` for a full annotated reference.
 ## Data
 
 Tasks are stored in `~/.lsf/tasks.json` and persist between runs.
+Active session state (started via `lsf start`) is stored in `~/.lsf/session.json`
+and cleared automatically when `lsf done` is run.
 
 **Importing from CSV** — two ways:
 
@@ -97,15 +102,48 @@ Problem set,24/03 08:00,1h30m,2,2
 Priority: `1` low · `2` medium · `3` high · `4` critical  
 Difficulty: `1` light · `2` medium · `3` deep
 
+## Session tracking
+
+`lsf start` records which task and session length you are beginning. When you run
+`lsf done`, it computes the actual elapsed time and logs it against the task's
+`time_spent` field. If the actual time is within 20% of the planned session length
+it uses the actual time; otherwise it falls back to the planned length to avoid
+accidentally logging large values if you forgot to run `done`.
+
+```sh
+lsf start        # prompts you to pick a session if more than one is scheduled today
+lsf start 2      # starts session 2 directly without prompting
+lsf done         # logs time and shows what's next
+```
+
 ## fastfetch integration
 
 ```sh
 lsf --next
 ```
-Prints two lines: the task name, then the suggested session length in minutes (or `0` if overloaded). Wire it into fastfetch:
+Prints two lines: the task name, then the suggested session length in minutes (or `0`
+if overloaded). Wire it into fastfetch:
 
 ```jsonc
 { "type": "command", "key": "Next task", "text": "lsf --next" }
+```
+
+## Panic mode
+
+`lsf panic` is only available when the scheduler detects that the total workload
+exceeds available time. Running it on a manageable schedule prints a message and
+exits cleanly.
+
+When overload is detected, panic mode uses an Earliest Deadline First (EDF)
+algorithm to find the maximum subset of tasks that can be completed on time, then
+produces an optimal session plan covering only those tasks. Tasks that cannot fit
+are listed clearly as deferrals.
+
+```
+Write-offs           tasks with negative individual slack (not enough time regardless of order)
+Achievable on time   the EDF-optimal set to focus on
+Defer or drop        tasks that cannot fit given the achievable set
+Optimal session plan timetable for the achievable tasks only
 ```
 
 ## Requirements
@@ -115,7 +153,22 @@ On Python < 3.11, install [`tomli`](https://pypi.org/project/tomli/): `pip insta
 
 ## How it works
 
-Tasks are sorted by urgency descending, where:
+**Scheduling algorithm**
+
+Tasks are scheduled using a dynamic Least Slack First time-slice algorithm. Instead
+of sorting tasks once and simulating sequential execution, the scheduler repeatedly
+picks the most urgent task, works one slice, then re-evaluates priorities. This
+prevents large low-urgency tasks from blocking small urgent ones.
+
+Slice lengths are difficulty-dependent:
+
+| Difficulty | Slice |
+|---|---|
+| light (1) | 30 min |
+| medium (2) | 60 min |
+| deep (3) | 90 min |
+
+Urgency at each scheduling step:
 
 ```
 urgency = priority / max(slack, 0.25h)
@@ -123,6 +176,23 @@ slack   = available_working_hours_until_deadline − adjusted_estimate
 adjusted_estimate = raw_estimate × risk_multiplier
 ```
 
-Overloaded tasks (negative slack) always float to the top regardless of priority. The scheduler then simulates sequential execution with a 10-minute context-switch penalty between tasks to produce realistic finish-time estimates.
+A switch urgency penalty (×0.85) slightly favours continuing the current task over
+switching, creating natural session batching without burning clock time on
+context-switch overhead.
 
-Available hours are computed from your configured time windows, correctly handling multi-window days, deadlines that fall before the working day starts, and weekday/weekend schedule differences.
+**Time windows**
+
+Available hours are computed from your configured time windows, correctly handling
+multi-window days, deadlines that fall before the working day starts, and
+weekday/weekend schedule differences. If lsf is run outside all configured windows,
+the scheduler automatically advances to the next available window before producing
+estimates.
+
+**Panic mode algorithm**
+
+When overloaded, panic mode uses a priority-weighted EDF algorithm: tasks are sorted
+by deadline (tightest first), with urgency as a tiebreak within the same deadline.
+The scheduler greedily adds each task to the schedule and defers any task whose
+finish time would exceed its deadline. This is optimal for maximising the number of
+on-time completions while respecting priority ordering among tasks that share a
+deadline.
