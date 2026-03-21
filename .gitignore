@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# makepkg artifacts
+*.pkg.tar.zst
+*.pkg.tar.xz
+src/
+pkg/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime data (personal, not for the repo)
+*.lsf/
