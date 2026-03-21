@@ -50,6 +50,7 @@ Edit it to match your actual available hours:
 [defaults]
 risk_multiplier    = 1.4  # estimates multiplied by this (Hofstadter buffer)
 switch_penalty_min = 10   # used for urgency calculation, not clock time
+break_min          = 10   # break shown between slices in the timetable
 
 [weekday]
 windows = [
@@ -116,6 +117,27 @@ lsf start 2      # starts session 2 directly without prompting
 lsf done         # logs time and shows what's next
 ```
 
+## Breaks
+
+`break_min` in config adds a rest period after each work slice in the timetable.
+Breaks are clipped to the remaining window time — they never push the cursor past a
+window boundary:
+
+```
+19:30 → 20:30  Composition draft  * 60m
+20:30 → 20:40  (break 10m)
+20:40 → 21:30  Composition draft  * 50m
+```
+
+If less time remains in the window than the configured break, the break is shortened
+to fit. If the slice ends exactly at a window boundary, no break is shown and the
+next session picks up at the next window naturally.
+
+Set `break_min = 0` to disable breaks entirely.
+
+Panic mode always ignores breaks and schedules continuous work — it is computing
+the theoretical maximum, not a sustainable pace.
+
 ## fastfetch integration
 
 ```sh
@@ -143,7 +165,7 @@ are listed clearly as deferrals.
 Write-offs           tasks with negative individual slack (not enough time regardless of order)
 Achievable on time   the EDF-optimal set to focus on
 Defer or drop        tasks that cannot fit given the achievable set
-Optimal session plan timetable for the achievable tasks only
+Optimal session plan timetable for the achievable tasks only (no breaks)
 ```
 
 ## Requirements
@@ -186,7 +208,7 @@ Available hours are computed from your configured time windows, correctly handli
 multi-window days, deadlines that fall before the working day starts, and
 weekday/weekend schedule differences. If lsf is run outside all configured windows,
 the scheduler automatically advances to the next available window before producing
-estimates.
+estimates, and the timetable shows "Next session at HH:MM" rather than "Start now".
 
 **Panic mode algorithm**
 

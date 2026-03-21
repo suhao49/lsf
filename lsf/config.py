@@ -26,6 +26,7 @@ DEFAULT_CONFIG_TOML = """\
 [defaults]
 risk_multiplier    = 1.4   # estimates are multiplied by this (Hofstadter buffer)
 switch_penalty_min = 10    # minutes lost when switching between tasks
+break_min          = 10    # break between slices (display only, clipped to window)
 
 [weekday]
 windows = [
@@ -142,6 +143,7 @@ def load_config() -> dict:
     defaults         = raw.get("defaults", {})
     risk             = float(defaults.get("risk_multiplier", 1.4))
     switch_min       = float(defaults.get("switch_penalty_min", 10))
+    break_min        = float(defaults.get("break_min", 10))
     wins_weekday     = parse_windows("weekday")
     wins_weekend     = parse_windows("weekend")
 
@@ -157,6 +159,7 @@ def load_config() -> dict:
         "windows_weekend":      wins_weekend,
         "risk_multiplier":      risk,
         "switch_penalty_h":     switch_min / 60,
+        "break_h":              break_min / 60,
         "total_day_h_weekday":  total_h(wins_weekday),
         "total_day_h_weekend":  total_h(wins_weekend),
     }

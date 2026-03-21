@@ -14,7 +14,8 @@ from .task import (
     _windows_for_day, _day_total_h,
     daylight_hours_until, add_working_hours,
     RISK_MULTIPLIER, SWITCH_PENALTY_H, EPSILON,
-    SLICE_H, SWITCH_URGENCY_PENALTY,
+    SLICE_H, SWITCH_URGENCY_PENALTY, BREAK_H,
+    _remaining_in_window,
 )
 from .util import (
     prompt, parse_due_date, parse_duration,
@@ -286,6 +287,8 @@ def display(tasks: list[Task], slices: list[Slice], now: datetime):
             if not win_slices:
                 print(f"    {DIM}(free){RESET}")
             else:
+                prev_slice_end = None
+                active_session = load_session()
                 for s in win_slices:
                     # Clip to window boundaries for display
                     display_start = max(s.start, ws, now)
@@ -294,9 +297,17 @@ def display(tasks: list[Task], slices: list[Slice], now: datetime):
                                            ).total_seconds() / 60)
                     if dur_min <= 0:
                         continue
+                    # Show break gap between consecutive slices
+                    if prev_slice_end is not None and BREAK_H > 0:
+                        gap_min = round((display_start - prev_slice_end
+                                         ).total_seconds() / 60)
+                        if 0 < gap_min <= round(BREAK_H * 60) + 1:
+                            brk_start = _fmt_slice_time(prev_slice_end, now)
+                            brk_end   = _fmt_window_time(display_start)
+                            print(f"    {DIM}{brk_start} → {brk_end}  "
+                                  f"(break {gap_min}m){RESET}")
                     diff_icon = DIFF_ICON.get(s.task.difficulty, "~")
                     late_flag = f"  {YELLOW}!{RESET}" if s.will_be_late else ""
-                    active_session = load_session()
                     is_active = (active_session and
                                  active_session.get("task_id") == s.task.id and
                                  s.start <= now <= s.end)
@@ -307,6 +318,7 @@ def display(tasks: list[Task], slices: list[Slice], now: datetime):
                           f"{BOLD}{s.task.name}{RESET}  "
                           f"{DIM}{diff_icon} {dur_min}m{RESET}"
                           f"{late_flag}{active_flag}")
+                    prev_slice_end = display_end
             print()
 
     # Show how many more slices are scheduled beyond today
@@ -415,12 +427,20 @@ def display(tasks: list[Task], slices: list[Slice], now: datetime):
         first = slices[0]
         t     = first.task
         dur   = round(first.duration_h * 60)
-        if t.overloaded:
-            label = f"{RED}OVERLOADED -- negotiate deadline or cut scope{RESET}"
-        else:
-            label = f"{GREEN}{BOLD}▶ {t.name}{RESET}  {DIM}({dur} min){RESET}"
+        in_window = _remaining_in_window(now) > 0
         print()
-        print(f"  {BOLD}Start now:{RESET}  {label}")
+        if t.overloaded:
+            print(f"  {BOLD}Start now:{RESET}  "
+                  f"{RED}OVERLOADED -- negotiate deadline or cut scope{RESET}")
+        elif in_window:
+            print(f"  {BOLD}Start now:{RESET}  "
+                  f"{GREEN}{BOLD}▶ {t.name}{RESET}  {DIM}({dur} min){RESET}")
+        else:
+            # Outside working hours -- show when the next session starts
+            next_start = first.start
+            print(f"  {BOLD}Next session:{RESET}  "
+                  f"{DIM}▶ {t.name}  ({dur} min)  "
+                  f"starting {next_start.strftime('%a %H:%M')}{RESET}")
 
     # -- Collective overload warning -------------------------------------------
     collectively_overloaded = _collectively_overloaded

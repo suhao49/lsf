@@ -32,6 +32,7 @@ SLICE_H = {
 # slightly favouring continuation of the current task.
 # 0.85 means a different task needs ~18% higher urgency to displace the current one.
 SWITCH_URGENCY_PENALTY = 0.85
+BREAK_H = CFG.get('break_h', 10 / 60)  # break between slices
 
 
 # -- Time utilities -----------------------------------------------------------
@@ -219,6 +220,18 @@ def _snap_to_next_window(now: datetime) -> datetime:
     return now  # fallback: shouldn't happen with a valid config
 
 
+def _remaining_in_window(cursor: datetime) -> float:
+    """Working hours left in the current window from cursor.
+    Returns 0 if cursor is not inside any window.
+    """
+    for ws_t, we_t in _windows_for_day(cursor.date()):
+        ws = datetime.combine(cursor.date(), ws_t)
+        we = datetime.combine(cursor.date(), we_t)
+        if ws <= cursor < we:
+            return (we - cursor).total_seconds() / 3600
+    return 0.0
+
+
 def schedule(tasks: list[Task], now: datetime) -> list[Task]:
     """
     Sort tasks once by urgency and simulate sequential execution.
@@ -243,7 +256,8 @@ def schedule(tasks: list[Task], now: datetime) -> list[Task]:
 
 # -- Dynamic LSF time-slice scheduler -----------------------------------------
 
-def schedule_sliced(tasks: list[Task], now: datetime) -> tuple[list[Slice], list[Task]]:
+def schedule_sliced(tasks: list[Task], now: datetime,
+                    break_h: float | None = None) -> tuple[list[Slice], list[Task]]:
     """
     Dynamic Least-Slack-First scheduler with time slicing.
 
@@ -256,10 +270,15 @@ def schedule_sliced(tasks: list[Task], now: datetime) -> tuple[list[Slice], list
         medium (2) -- 60 min
         deep   (3) -- 90 min
 
+    break_h parameter: override break length (pass 0.0 to disable, e.g. for panic mode).
+    Defaults to the configured break_h from config.toml.
+
     Returns:
         slices     -- ordered list of Slice objects (the session plan)
         tasks      -- the original task list with finish_time / will_be_late set
     """
+    if break_h is None:
+        break_h = BREAK_H
     # Initial compute() pass to populate adjusted/remaining estimates.
     # We do this here so callers don't have to pre-compute.
     for t in tasks:
@@ -305,7 +324,18 @@ def schedule_sliced(tasks: list[Task], now: datetime) -> tuple[list[Slice], list
 
         slices.append(Slice(chosen, slice_h, start, end))
         remaining[chosen.id] -= slice_h
-        cursor  = end
+        # Apply break after slice, clipped to remaining window time.
+        # Breaks never push the cursor past a window boundary -- the next
+        # slice picks up at the next window start naturally.
+        if break_h > 0 and remaining[chosen.id] > 1e-6:
+            win_left = _remaining_in_window(end)
+            actual_break = min(break_h, win_left)
+            if actual_break > 0:
+                cursor = end + timedelta(hours=actual_break)
+            else:
+                cursor = end
+        else:
+            cursor = end
         prev_id = chosen.id
 
     # Back-fill task-level finish_time and will_be_late from the last slice of each task
