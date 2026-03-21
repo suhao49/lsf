@@ -9,6 +9,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, date
 
+from . import __version__
 from .task import (
     Task, Slice, schedule, schedule_sliced, today_slices, edf_max_subset,
     _windows_for_day, _day_total_h,
@@ -815,7 +816,15 @@ def main():
         "--next", action="store_true",
         help="Machine-readable output: print next task name and session minutes, then exit"
     )
+    parser.add_argument(
+        "-v", "--version", action="store_true",
+        help="Print version and exit"
+    )
     args = parser.parse_args()
+
+    if args.version:
+        print(f"lsf {__version__}")
+        return
 
     # -- lsf start [n] -------------------------------------------------
     if args.command == "start":
