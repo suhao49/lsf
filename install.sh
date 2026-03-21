@@ -12,7 +12,7 @@ set -e
 # Editable / dev install
 if [ "$1" = "--dev" ]; then
     echo "Installing lsf in editable mode..."
-    pip install --editable .
+    pip install --editable . --force-reinstall
     echo "Done. 'lsf' now reflects live changes to the source."
     exit 0
 fi
@@ -24,6 +24,7 @@ echo "Installing lsf to $PREFIX..."
 pip install \
     --prefix="$PREFIX" \
     --no-build-isolation \
+    --force-reinstall \
     .
 
 echo ""
