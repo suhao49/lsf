@@ -367,7 +367,7 @@ def display(tasks: list[Task], slices: list[Slice], now: datetime):
 
     from collections import defaultdict
     tasks_by_due: dict = defaultdict(list)
-    for _t in sorted(tasks, key=lambda t: (0 if t.overloaded else 1, t.due, -t.urgency)):
+    for _t in sorted(tasks, key=lambda t: (t.due, -t.urgency)):
         tasks_by_due[_t.due.date()].append(_t)
 
     display_tasks = [t for ts in tasks_by_due.values() for t in ts]
