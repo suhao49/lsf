@@ -4,7 +4,7 @@ A terminal assignment scheduler that prioritises tasks by how little time you ha
 
 ## Install
 
-**Via pip (recommended):**
+**Via installer (recommended):**
 ```sh
 git clone https://github.com/suhao49/lsf
 cd lsf
