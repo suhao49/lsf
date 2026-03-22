@@ -13,42 +13,29 @@ from .config import load as load_config
 
 # -- Constants ----------------------------------------------------------------
 
-CFG              = load_config()
-RISK_MULTIPLIER  = CFG['risk_multiplier']
-SWITCH_PENALTY_H = CFG['switch_penalty_h']
-EPSILON          = 0.01
-
-# Slice lengths by difficulty (hours).
-# Deep work needs long uninterrupted sessions to reach flow state.
-# Light work can be chunked small without cognitive cost.
-SLICE_H = {
-    1: 0.5,    # light  -- 30 min
-    2: 1.0,    # medium -- 60 min
-    3: 1.5,    # deep   -- 90 min
-}
-
-# Switching between tasks wastes time re-orienting.
-# This multiplier reduces a task's urgency when it would require a switch,
-# slightly favouring continuation of the current task.
-# 0.85 means a different task needs ~18% higher urgency to displace the current one.
-SWITCH_URGENCY_PENALTY = 0.85
-BREAK_H = CFG.get('break_h', 10 / 60)  # break between slices
+CFG                   = load_config()
+RISK_MULTIPLIER       = CFG['risk_multiplier']
+SWITCH_PENALTY_H      = CFG['switch_penalty_h']
+BREAK_H               = CFG['break_h']
+SLICE_H               = CFG['slice_h']
+SWITCH_URGENCY_PENALTY = CFG['switch_urgency_penalty']
+URGENCY_SLACK_FLOOR   = CFG['urgency_slack_floor_h']
+EPSILON               = 0.01
 
 
 # -- Time utilities -----------------------------------------------------------
 
 def _windows_for_day(d: date) -> list[tuple[dtime, dtime]]:
-    """Return the list of (start, end) time windows for a given date."""
-    if d.weekday() < 5:   # Mon=0 ... Fri=4
-        return CFG["windows_weekday"]
-    return CFG["windows_weekend"]
+    """Return the list of (start, end) time windows for a given date.
+    Individual day sections ([monday]..[sunday]) take precedence over
+    [weekday] / [weekend] defaults.
+    """
+    return CFG["windows_by_day"][d.weekday()]
 
 
 def _day_total_h(d: date) -> float:
     """Total available working hours on a given date."""
-    if d.weekday() < 5:
-        return CFG["total_day_h_weekday"]
-    return CFG["total_day_h_weekend"]
+    return CFG["total_h_by_day"][d.weekday()]
 
 
 def daylight_hours_until(due: datetime, now: datetime) -> float:
@@ -164,7 +151,8 @@ class Task:
 
         # raw_urgency: continuous scale, used by the slice scheduler so overloaded
         # tasks still compete with non-overloaded ones rather than always winning.
-        effective_slack   = max(self.slack, 0.25) if self.slack >= 0 else max(-self.slack, 0.25)
+        effective_slack   = max(self.slack, URGENCY_SLACK_FLOOR) if self.slack >= 0 \
+                            else max(-self.slack, URGENCY_SLACK_FLOOR)
         self.raw_urgency  = self.priority / effective_slack
         if current_task_id is not None and current_task_id != self.id:
             self.raw_urgency *= SWITCH_URGENCY_PENALTY

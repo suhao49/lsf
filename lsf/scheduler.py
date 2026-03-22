@@ -15,7 +15,7 @@ from .task import (
     _windows_for_day, _day_total_h,
     daylight_hours_until, add_working_hours,
     RISK_MULTIPLIER, SWITCH_PENALTY_H, EPSILON,
-    SLICE_H, SWITCH_URGENCY_PENALTY, BREAK_H,
+    SLICE_H, SWITCH_URGENCY_PENALTY, BREAK_H, URGENCY_SLACK_FLOOR,
     _remaining_in_window,
 )
 from .util import (
@@ -25,8 +25,10 @@ from .util import (
 
 # RISK_MULTIPLIER, SWITCH_PENALTY_H, EPSILON live in task.py (used by Task/schedule)
 # and are imported via the task import block above.
-DEEP_CAP_PER_DAY   = 4.0   # used only in burndown display
-MEDIUM_CAP_PER_DAY = 6.0
+from .config import load as _load_cfg
+_CFG = _load_cfg()
+DEEP_CAP_PER_DAY   = _CFG['deep_cap_per_day']
+MEDIUM_CAP_PER_DAY = _CFG['medium_cap_per_day']
 
 DATA_DIR      = os.path.expanduser("~/.lsf")
 DATA_FILE     = os.path.join(DATA_DIR, "tasks.json")
@@ -93,12 +95,11 @@ def load_session() -> dict | None:
         return None
 
 
-def save_session(task_id: str, duration_h: float, started_at: str):
-    """Persist the current slice so lsf done knows what to mark complete."""
+def save_session(task_id: str, started_at: str):
+    """Persist the active task timer so lsf done knows what to log."""
     ensure_data_dir()
     with open(SESSION_FILE, "w", encoding="utf-8") as f:
-        json.dump({"task_id": task_id, "duration_h": duration_h,
-                   "started_at": started_at}, f)
+        json.dump({"task_id": task_id, "started_at": started_at}, f)
 
 
 def clear_session():
@@ -804,8 +805,8 @@ def main():
             "schedule (default) -- interactive schedule; "
             "panic -- survival triage when overloaded; "
             "import -- import tasks from a CSV file; "
-            "start -- begin the current slice (saves to session.json); "
-            "done -- mark current slice complete and add time to task"
+            "start -- start a timer for a task (pick by number or id); "
+            "done -- stop timer and log actual elapsed time to task"
         )
     )
     parser.add_argument(
@@ -826,70 +827,83 @@ def main():
         print(f"lsf {__version__}")
         return
 
-    # -- lsf start [n] -------------------------------------------------
+    # -- lsf start [n|id] ---------------------------------------------
+    # Pick any task by number or id and start a timer for it.
+    # No slice logic -- just choose a task and go.
     if args.command == "start":
-        raw    = load_tasks()
-        tasks  = [dict_to_task(d) for d in raw]
+        raw   = load_tasks()
+        tasks = [dict_to_task(d) for d in raw]
         if not tasks:
             print("  No tasks found.")
             return
-        _now = datetime.now()
-        slices, _ = schedule_sliced(tasks, _now)
-        if not slices:
-            print("  No sessions to start.")
-            return
-
-        # args.file is reused as the optional slice number argument
-        # e.g. "lsf start 3" starts the 3rd slice in today's plan
-        day_slices, _, _ = today_slices(slices, _now)
-        if not day_slices:
-            day_slices = slices   # outside windows -- show all
 
         chosen = None
         if args.file is not None:
+            # Try as task number first, then as id prefix
             try:
                 n = int(args.file)
-                if 1 <= n <= len(day_slices):
-                    chosen = day_slices[n - 1]
+                if 1 <= n <= len(tasks):
+                    chosen = tasks[n - 1]
                 else:
-                    print(f"  {RED}Invalid slice number. Today has {len(day_slices)} session(s).{RESET}")
+                    print(f"  {RED}Invalid task number. You have {len(tasks)} task(s).{RESET}")
                     return
             except ValueError:
-                print(f"  {RED}Usage: lsf start [session number]{RESET}")
-                return
-
-        if chosen is None:
-            if len(day_slices) == 1:
-                chosen = day_slices[0]
-            else:
-                # Show a numbered list and ask
-                print()
-                print(f"  {BOLD}Choose a session to start:{RESET}")
-                print()
-                for i, s in enumerate(day_slices, 1):
-                    dur_min  = round(s.duration_h * 60)
-                    d_icon   = DIFF_ICON.get(s.task.difficulty, "~")
-                    start_s  = _fmt_slice_time(s.start, _now)
-                    end_s    = _fmt_window_time(s.end)
-                    print(f"    {CYAN}{i}.{RESET} {start_s} -> {end_s}  "
-                          f"{s.task.name}  {DIM}{d_icon} {dur_min}m{RESET}")
-                print()
-                raw_choice = prompt("Session number", "1")
-                try:
-                    n = int(raw_choice)
-                    if 1 <= n <= len(day_slices):
-                        chosen = day_slices[n - 1]
-                    else:
-                        print(f"  {RED}Invalid number.{RESET}")
-                        return
-                except ValueError:
-                    print(f"  {RED}Invalid input.{RESET}")
+                # Try as id prefix
+                matches = [t for t in tasks if t.id.startswith(args.file)]
+                if len(matches) == 1:
+                    chosen = matches[0]
+                elif len(matches) > 1:
+                    print(f"  {RED}Ambiguous id prefix '{args.file}' -- be more specific.{RESET}")
+                    return
+                else:
+                    print(f"  {RED}No task found with id '{args.file}'.{RESET}")
                     return
 
-        save_session(chosen.task.id, chosen.duration_h,
-                     datetime.now().isoformat())
-        dur_min = round(chosen.duration_h * 60)
-        print(f"\n  {GREEN}>>  Started: {chosen.task.name}  ({dur_min} min){RESET}")
+        if chosen is None:
+            # Show task list and prompt
+            print()
+            print(f"  {BOLD}Choose a task to start:{RESET}")
+            print()
+            _now_tmp = datetime.now()
+            slices_tmp, ordered_tmp = schedule_sliced(tasks, _now_tmp)
+            for i, t in enumerate(ordered_tmp, 1):
+                d_icon = DIFF_ICON.get(t.difficulty, "~")
+                stars  = '*' * t.priority
+                spent  = f"  {DIM}({fmt_hours(t.time_spent)} spent){RESET}" if t.time_spent > 0 else ""
+                print(f"    {CYAN}{i}.{RESET} {t.name}  "
+                      f"{DIM}{d_icon} {stars} [{t.id}]{RESET}"
+                      f"{spent}")
+            print()
+            raw_choice = prompt("Task number", "1")
+            try:
+                n = int(raw_choice)
+                if 1 <= n <= len(ordered_tmp):
+                    chosen = ordered_tmp[n - 1]
+                else:
+                    print(f"  {RED}Invalid number.{RESET}")
+                    return
+            except ValueError:
+                print(f"  {RED}Invalid input.{RESET}")
+                return
+
+        # Check if a session is already running
+        existing = load_session()
+        if existing:
+            existing_tasks = [dict_to_task(d) for d in load_tasks()]
+            existing_t = next((t for t in existing_tasks
+                               if t.id == existing['task_id']), None)
+            existing_name = existing_t.name if existing_t else existing['task_id']
+            started_at = datetime.fromisoformat(existing['started_at'])
+            elapsed = (datetime.now() - started_at).total_seconds() / 60
+            print(f"\n  {YELLOW}Session already running: {existing_name} "
+                  f"({elapsed:.0f}m elapsed){RESET}")
+            overwrite = prompt("Start new session anyway? (y/N)", "n").lower()
+            if overwrite != "y":
+                print()
+                return
+
+        save_session(chosen.id, datetime.now().isoformat())
+        print(f"\n  {GREEN}>>  Started: {chosen.name}{RESET}")
         print(f"  {DIM}Run 'lsf done' when finished.{RESET}\n")
         return
 
@@ -906,14 +920,8 @@ def main():
             print(f"  {YELLOW}Session task no longer exists.{RESET}")
             clear_session()
             return
-        started    = datetime.fromisoformat(session["started_at"])
-        actual_h   = (datetime.now() - started).total_seconds() / 3600
-        logged_h   = session["duration_h"]
-        # Use actual time if it's within 20% of planned, otherwise use planned
-        # This prevents accidental huge logs if the user forgot to run done
-        used_h     = actual_h if abs(actual_h - logged_h) / max(logged_h, 0.1) < 0.2 \
-                     else logged_h
-        # Find and update the matching task in raw dicts
+        started = datetime.fromisoformat(session["started_at"])
+        used_h  = (datetime.now() - started).total_seconds() / 3600
         for d in raw:
             if d["id"] == session["task_id"]:
                 d["time_spent"] = round(d.get("time_spent", 0.0) + used_h, 4)

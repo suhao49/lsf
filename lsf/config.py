@@ -25,8 +25,25 @@ DEFAULT_CONFIG_TOML = """\
 
 [defaults]
 risk_multiplier    = 1.4   # estimates are multiplied by this (Hofstadter buffer)
-switch_penalty_min = 10    # minutes lost when switching between tasks
-break_min          = 10    # break between slices (display only, clipped to window)
+switch_penalty_min = 10    # minutes of urgency penalty when switching tasks
+break_min          = 10    # break shown between slices (clipped to window; 0 to disable)
+
+# Slice lengths per difficulty level (minutes)
+slice_light_min    = 30    # difficulty 1 -- reading, MCQ, admin
+slice_medium_min   = 60    # difficulty 2 -- problem sets, short writing
+slice_deep_min     = 90    # difficulty 3 -- essays, coding, creative work
+
+# How strongly to favour continuing the current task vs switching
+# 1.0 = no preference, 0.0 = never switch, 0.85 is a good default
+switch_urgency_penalty = 0.85
+
+# Minimum effective slack used in urgency calculation (hours)
+# Prevents urgency spikes when a task is almost exactly on time
+urgency_slack_floor_h  = 0.25
+
+# Burndown forecast caps (hours of each type per day)
+deep_cap_per_day   = 4.0
+medium_cap_per_day = 6.0
 
 [weekday]
 windows = [
@@ -38,6 +55,16 @@ windows = [
   { start = "09:00", end = "17:00" },
 ]
 
+# -- Per-day overrides (optional) --
+# Individual day sections override [weekday] or [weekend] for that specific day.
+# Day names: [monday] [tuesday] [wednesday] [thursday] [friday] [saturday] [sunday]
+#
+# [saturday]
+# windows = [
+#   { start = "10:00", end = "14:00" },
+#   { start = "20:00", end = "23:00" },
+# ]
+#
 # -- Student / school schedule example (uncomment to use) --
 #
 # [weekday]
@@ -104,12 +131,20 @@ def load_config() -> dict:
     if no config is found in the search path ($LSF_CONFIG → ./config.toml → XDG).
 
     Returns a normalised dict with keys:
-        windows_weekday     : list of (dtime, dtime) tuples
-        windows_weekend     : list of (dtime, dtime) tuples
-        risk_multiplier     : float
-        switch_penalty_h    : float
-        total_day_h_weekday : float
-        total_day_h_weekend : float
+        windows_weekday        : list of (dtime, dtime) tuples  (default for Mon-Fri)
+        windows_weekend        : list of (dtime, dtime) tuples  (default for Sat-Sun)
+        windows_by_day         : dict[int, list[tuple]] keyed 0=Mon..6=Sun
+                                 individual day sections override weekday/weekend
+        risk_multiplier        : float
+        switch_penalty_h       : float
+        break_h                : float
+        slice_h                : dict[int, float]  -- {1: light_h, 2: med_h, 3: deep_h}
+        switch_urgency_penalty : float
+        urgency_slack_floor_h  : float
+        deep_cap_per_day       : float
+        medium_cap_per_day     : float
+        total_day_h_weekday    : float
+        total_day_h_weekend    : float
     """
     cfg_path = _find_config()
     if not os.path.isfile(cfg_path):
@@ -126,26 +161,47 @@ def load_config() -> dict:
         print(f"  Warning: could not parse {cfg_path} ({e}). Using 9-5 defaults.")
         raw = {}
 
+    _FALLBACK_WINDOWS = [(_parse_time("09:00"), _parse_time("17:00"))]
+
     def parse_windows(section_key: str) -> list[tuple[dtime, dtime]]:
+        """Parse a [section] windows list, returning 9-5 if absent."""
         section = raw.get(section_key, {})
         wins    = section.get("windows", [])
         if not wins:
-            # fallback: bare 9-5
-            return [(_parse_time("09:00"), _parse_time("17:00"))]
+            return _FALLBACK_WINDOWS
         result = []
         for w in wins:
             try:
                 result.append((_parse_time(w["start"]), _parse_time(w["end"])))
             except (KeyError, ValueError):
                 pass
-        return result or [(_parse_time("09:00"), _parse_time("17:00"))]
+        return result or _FALLBACK_WINDOWS
 
     defaults         = raw.get("defaults", {})
     risk             = float(defaults.get("risk_multiplier", 1.4))
     switch_min       = float(defaults.get("switch_penalty_min", 10))
     break_min        = float(defaults.get("break_min", 10))
+    slice_light      = float(defaults.get("slice_light_min", 30))
+    slice_medium     = float(defaults.get("slice_medium_min", 60))
+    slice_deep       = float(defaults.get("slice_deep_min", 90))
+    switch_urg_pen   = float(defaults.get("switch_urgency_penalty", 0.85))
+    slack_floor      = float(defaults.get("urgency_slack_floor_h", 0.25))
+    deep_cap         = float(defaults.get("deep_cap_per_day", 4.0))
+    medium_cap       = float(defaults.get("medium_cap_per_day", 6.0))
     wins_weekday     = parse_windows("weekday")
     wins_weekend     = parse_windows("weekend")
+
+    # Per-day overrides: [monday]..[sunday] take precedence over weekday/weekend
+    _DAY_NAMES = ["monday", "tuesday", "wednesday",
+                  "thursday", "friday", "saturday", "sunday"]
+    wins_by_day: dict[int, list[tuple[dtime, dtime]]] = {}
+    for day_num, day_name in enumerate(_DAY_NAMES):
+        if day_name in raw:
+            wins_by_day[day_num] = parse_windows(day_name)
+        elif day_num < 5:
+            wins_by_day[day_num] = wins_weekday
+        else:
+            wins_by_day[day_num] = wins_weekend
 
     def total_h(windows):
         return sum(
@@ -154,14 +210,32 @@ def load_config() -> dict:
             for s, e in windows if e > s
         )
 
+    def total_h_for_day(day_num: int) -> float:
+        return sum(
+            (datetime.combine(date.today(), e) - datetime.combine(date.today(), s)
+             ).total_seconds() / 3600
+            for s, e in wins_by_day[day_num] if e > s
+        )
+
     return {
-        "windows_weekday":      wins_weekday,
-        "windows_weekend":      wins_weekend,
-        "risk_multiplier":      risk,
-        "switch_penalty_h":     switch_min / 60,
-        "break_h":              break_min / 60,
-        "total_day_h_weekday":  total_h(wins_weekday),
-        "total_day_h_weekend":  total_h(wins_weekend),
+        "windows_weekday":        wins_weekday,
+        "windows_weekend":        wins_weekend,
+        "windows_by_day":         wins_by_day,
+        "total_h_by_day":         {d: total_h_for_day(d) for d in range(7)},
+        "risk_multiplier":        risk,
+        "switch_penalty_h":       switch_min / 60,
+        "break_h":                break_min / 60,
+        "slice_h": {
+            1: slice_light  / 60,
+            2: slice_medium / 60,
+            3: slice_deep   / 60,
+        },
+        "switch_urgency_penalty": switch_urg_pen,
+        "urgency_slack_floor_h":  slack_floor,
+        "deep_cap_per_day":       deep_cap,
+        "medium_cap_per_day":     medium_cap,
+        "total_day_h_weekday":    total_h_for_day(0),  # Monday as representative weekday
+        "total_day_h_weekend":    total_h_for_day(5),  # Saturday as representative weekend
     }
 
 # Convenience alias

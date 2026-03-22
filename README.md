@@ -39,18 +39,38 @@ lsf panic                # survival triage (only available when overloaded)
 lsf import tasks.csv     # import assignments from a CSV file
 lsf import               # import from ~/.lsf/import.csv (hot-folder)
 lsf --next               # machine-readable next task (for fastfetch/status bars)
+lsf -v                   # print version and exit
 ```
 
 ## Configuration
 
-On first run, lsf creates `~/.config/lsf/config.toml` with a default 9–5 schedule.
-Edit it to match your actual available hours:
+On first run, lsf creates `~/.config/lsf/config.toml` with defaults. All scheduler
+behaviour is controlled from this file — no source edits needed.
 
 ```toml
 [defaults]
-risk_multiplier    = 1.4  # estimates multiplied by this (Hofstadter buffer)
-switch_penalty_min = 10   # used for urgency calculation, not clock time
-break_min          = 10   # break shown between slices in the timetable
+# ── Estimation ────────────────────────────────────────────────────────────────
+risk_multiplier    = 1.4   # raw estimates are multiplied by this (Hofstadter buffer)
+
+# ── Slices ────────────────────────────────────────────────────────────────────
+slice_light_min    = 30    # session length for difficulty 1 tasks (reading, MCQ, admin)
+slice_medium_min   = 60    # session length for difficulty 2 tasks (problem sets, writing)
+slice_deep_min     = 90    # session length for difficulty 3 tasks (essays, coding)
+
+# ── Breaks ────────────────────────────────────────────────────────────────────
+break_min          = 10    # rest shown between slices in timetable; 0 to disable
+                           # breaks are clipped to the remaining window time
+
+# ── Urgency tuning ────────────────────────────────────────────────────────────
+switch_penalty_min    = 10    # urgency penalty (minutes) applied when switching tasks
+switch_urgency_penalty = 0.85 # multiplier on urgency of a different task (0–1)
+                               # lower = stronger preference for continuing current task
+urgency_slack_floor_h  = 0.25 # minimum effective slack used in urgency calculation (hours)
+                               # prevents spikes when a task is almost exactly on time
+
+# ── Burndown display ──────────────────────────────────────────────────────────
+deep_cap_per_day   = 4.0   # assumed max deep work hours per day (burndown forecast)
+medium_cap_per_day = 6.0   # assumed max medium work hours per day
 
 [weekday]
 windows = [
@@ -65,14 +85,27 @@ windows = [
   { start = "17:00", end = "17:30" },
   { start = "19:30", end = "22:30" },
 ]
+
+# Per-day overrides (optional)
+# [monday] through [sunday] take precedence over [weekday] / [weekend]
+# for that specific day. Useful for days with unusual schedules.
+[saturday]
+windows = [
+  { start = "10:00", end = "14:00" },
+  { start = "20:00", end = "23:00" },
+]
 ```
 
-See `config/config.toml.example` for a full annotated reference.
+Any day name (`monday` through `sunday`) can be given its own `windows` list.
+It overrides the `[weekday]` or `[weekend]` default only for that day — all
+other days continue to use the group default.
 
 **Config search order** (first match wins):
 1. `$LSF_CONFIG` environment variable
 2. `./config.toml` in the current working directory
 3. `~/.config/lsf/config.toml` (default)
+
+See `config/config.toml.example` for a full annotated reference.
 
 ## Data
 
@@ -105,23 +138,25 @@ Difficulty: `1` light · `2` medium · `3` deep
 
 ## Session tracking
 
-`lsf start` records which task and session length you are beginning. When you run
-`lsf done`, it computes the actual elapsed time and logs it against the task's
-`time_spent` field. If the actual time is within 20% of the planned session length
-it uses the actual time; otherwise it falls back to the planned length to avoid
-accidentally logging large values if you forgot to run `done`.
+`lsf start` starts a timer for any task. `lsf done` stops it and logs the actual
+elapsed time directly to that task's `time_spent` field — no tolerance checks,
+no planned duration involved.
 
 ```sh
-lsf start        # prompts you to pick a session if more than one is scheduled today
-lsf start 2      # starts session 2 directly without prompting
-lsf done         # logs time and shows what's next
+lsf start        # shows your tasks and prompts you to pick one
+lsf start 2      # starts a timer for task 2 directly
+lsf start a1b2   # starts a timer by task id prefix
+lsf done         # stops the timer and logs however long it actually took
 ```
+
+If a session is already running when you call `lsf start`, it will warn you and
+ask before overwriting it. The active session is stored in `~/.lsf/session.json`
+and cleared when `lsf done` is run.
 
 ## Breaks
 
-`break_min` in config adds a rest period after each work slice in the timetable.
-Breaks are clipped to the remaining window time — they never push the cursor past a
-window boundary:
+`break_min` adds a rest period after each work slice in the timetable. Breaks are
+clipped to the remaining window time and never push the cursor past a window boundary:
 
 ```
 19:30 → 20:30  Composition draft  * 60m
@@ -129,14 +164,7 @@ window boundary:
 20:40 → 21:30  Composition draft  * 50m
 ```
 
-If less time remains in the window than the configured break, the break is shortened
-to fit. If the slice ends exactly at a window boundary, no break is shown and the
-next session picks up at the next window naturally.
-
-Set `break_min = 0` to disable breaks entirely.
-
-Panic mode always ignores breaks and schedules continuous work — it is computing
-the theoretical maximum, not a sustainable pace.
+Set `break_min = 0` to disable breaks. Panic mode always ignores breaks.
 
 ## fastfetch integration
 
@@ -159,13 +187,14 @@ exits cleanly.
 When overload is detected, panic mode uses an Earliest Deadline First (EDF)
 algorithm to find the maximum subset of tasks that can be completed on time, then
 produces an optimal session plan covering only those tasks. Tasks that cannot fit
-are listed clearly as deferrals.
+are listed clearly as deferrals. Panic mode ignores breaks and all urgency tuning
+knobs — it computes the theoretical maximum.
 
 ```
 Write-offs           tasks with negative individual slack (not enough time regardless of order)
 Achievable on time   the EDF-optimal set to focus on
 Defer or drop        tasks that cannot fit given the achievable set
-Optimal session plan timetable for the achievable tasks only (no breaks)
+Optimal session plan timetable for the achievable tasks only
 ```
 
 ## Requirements
@@ -182,25 +211,19 @@ of sorting tasks once and simulating sequential execution, the scheduler repeate
 picks the most urgent task, works one slice, then re-evaluates priorities. This
 prevents large low-urgency tasks from blocking small urgent ones.
 
-Slice lengths are difficulty-dependent:
-
-| Difficulty | Slice |
-|---|---|
-| light (1) | 30 min |
-| medium (2) | 60 min |
-| deep (3) | 90 min |
+Slice lengths are configurable per difficulty level (defaults: 30/60/90 min).
 
 Urgency at each scheduling step:
 
 ```
-urgency = priority / max(slack, 0.25h)
+urgency = priority / max(slack, urgency_slack_floor_h)
 slack   = available_working_hours_until_deadline − adjusted_estimate
 adjusted_estimate = raw_estimate × risk_multiplier
 ```
 
-A switch urgency penalty (×0.85) slightly favours continuing the current task over
-switching, creating natural session batching without burning clock time on
-context-switch overhead.
+A configurable switch urgency penalty (`switch_urgency_penalty`, default 0.85)
+slightly favours continuing the current task over switching, creating natural session
+batching without burning clock time on context-switch overhead.
 
 **Time windows**
 
