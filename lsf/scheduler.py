@@ -30,7 +30,20 @@ _CFG = _load_cfg()
 DEEP_CAP_PER_DAY   = _CFG['deep_cap_per_day']
 MEDIUM_CAP_PER_DAY = _CFG['medium_cap_per_day']
 
-DATA_DIR      = os.path.expanduser("~/.lsf")
+# Platform-appropriate data directory:
+#   macOS   : ~/Library/Application Support/lsf
+#   Windows : %LOCALAPPDATA%/lsf  (e.g. C:/Users/You/AppData/Local/lsf)
+#   Linux   : ~/.lsf
+def _default_data_dir() -> str:
+    import sys
+    if os.name == "nt":                          # Windows
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "lsf")
+    if sys.platform == "darwin":                 # macOS
+        return os.path.expanduser("~/Library/Application Support/lsf")
+    return os.path.expanduser("~/.lsf")          # Linux
+
+DATA_DIR      = _default_data_dir()
 DATA_FILE     = os.path.join(DATA_DIR, "tasks.json")
 CSV_FILE      = os.path.join(DATA_DIR, "import.csv")
 SESSION_FILE  = os.path.join(DATA_DIR, "session.json")
@@ -85,7 +98,7 @@ def save_tasks(tasks: list[dict]):
 
 
 def load_session() -> dict | None:
-    """Load the active session from ~/.lsf/session.json, or None if absent."""
+    """Load the active session from the session file, or None if absent."""
     if not os.path.exists(SESSION_FILE):
         return None
     try:
@@ -112,7 +125,7 @@ def import_csv(existing: list[dict], csv_path: str = CSV_FILE) -> tuple[list[dic
     Merge tasks from a CSV file into the existing task list.
     Tasks matched by (name, due) are left untouched to preserve progress.
 
-    csv_path defaults to ~/.lsf/import.csv (hot-folder for automation),
+    csv_path defaults to the platform data dir import.csv (hot-folder for automation),
     but any path can be passed explicitly via 'lsf import <file>'.
     """
     if not os.path.exists(csv_path):
@@ -948,7 +961,7 @@ def main():
     now = datetime.now()
     raw = load_tasks()
 
-    # Hot-folder auto-import from ~/.lsf/import.csv
+    # Hot-folder auto-import from the data dir import.csv
     raw, csv_added = import_csv(raw)
     if csv_added:
         save_tasks(raw)
@@ -1003,7 +1016,7 @@ def main():
     print(f"{BOLD}  lsf -- Least Slack First{RESET}  {DIM}(as of {now:%H:%M, %a %d %b}){RESET}")
     print(f"{BOLD}{'-'*62}{RESET}")
     if tasks:
-        print(f"  {DIM}{len(tasks)} task(s) loaded from ~/.lsf/tasks.json{RESET}")
+        print(f"  {DIM}{len(tasks)} task(s) loaded from {DATA_FILE}{RESET}")
     else:
         print(f"  {DIM}No saved tasks found.{RESET}")
     print()
@@ -1034,7 +1047,7 @@ def main():
 
     if changed:
         save_tasks([task_to_dict(t) for t in tasks])
-        print(f"  {DIM}Saved to ~/.lsf/tasks.json{RESET}")
+        print(f"  {DIM}Saved to {DATA_FILE}{RESET}")
         print()
         slices, ordered = schedule_sliced(tasks, now)   # re-run after changes
 

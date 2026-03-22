@@ -1,7 +1,10 @@
 """
 lsf.config -- configuration loader
 
-Reads ~/.config/lsf/config.toml, creates it with defaults on first run.
+Reads the platform config file, creates it with defaults on first run.
+  Linux  : ~/.config/lsf/config.toml  (or $XDG_CONFIG_HOME/lsf)
+  macOS  : ~/Library/Application Support/lsf/config.toml
+  Windows: %APPDATA%\\lsf\\config.toml
 Uses stdlib tomllib (3.11+) with a hand-rolled fallback for older Python.
 """
 
@@ -11,12 +14,28 @@ from datetime import datetime, date, time as dtime
 
 # -- Config loader ------------------------------------------------------------
 
-CONFIG_DIR  = os.path.expanduser("~/.config/lsf")
+# Platform-appropriate config directory:
+#   macOS   : ~/Library/Application Support/lsf
+#   Windows : %APPDATA%/lsf  (e.g. C:/Users/You/AppData/Roaming/lsf)
+#   Linux   : ~/.config/lsf  (XDG_CONFIG_HOME)
+def _default_config_dir() -> str:
+    if os.name == "nt":                          # Windows
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "lsf")
+    if sys.platform == "darwin":                 # macOS
+        return os.path.expanduser("~/Library/Application Support/lsf")
+    # Linux / everything else: respect XDG_CONFIG_HOME
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(xdg, "lsf")
+
+CONFIG_DIR  = _default_config_dir()
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.toml")
 
 DEFAULT_CONFIG_TOML = """\
 # lsf configuration
-# Paths: ~/.config/lsf/config.toml
+# Linux:   ~/.config/lsf/config.toml
+# macOS:   ~/Library/Application Support/lsf/config.toml
+# Windows: %APPDATA%/lsf/config.toml
 #
 # Define one or more time windows per day type.
 # Use 24-hour "HH:MM" strings.
@@ -114,7 +133,9 @@ def _find_config() -> str:
     Locate the config file using a priority search:
       1. $LSF_CONFIG environment variable
       2. ./config.toml in the current working directory
-      3. ~/.config/lsf/config.toml  (XDG default, always used as write target)
+      3. platform default config dir (always used as write target)
+         Linux: ~/.config/lsf/  macOS: ~/Library/Application Support/lsf/
+         Windows: %APPDATA%/lsf/
     """
     env = os.environ.get("LSF_CONFIG")
     if env:
@@ -127,8 +148,8 @@ def _find_config() -> str:
 
 def load_config() -> dict:
     """
-    Load the lsf config file, creating ~/.config/lsf/config.toml with defaults
-    if no config is found in the search path ($LSF_CONFIG → ./config.toml → XDG).
+    Load the lsf config file, creating the platform config file with defaults
+    if no config is found in the search path ($LSF_CONFIG → ./config.toml → platform default).
 
     Returns a normalised dict with keys:
         windows_weekday        : list of (dtime, dtime) tuples  (default for Mon-Fri)

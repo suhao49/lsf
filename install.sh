@@ -1,39 +1,40 @@
 #!/bin/sh
 # lsf installer
-# Uses pip to install properly via pyproject.toml.
 #
 # Usage:
-#   sudo ./install.sh            -- installs system-wide to /usr/local
-#   PREFIX=~/.local ./install.sh -- installs to ~/.local (no sudo needed)
-#   ./install.sh --dev           -- editable install into current Python env
+#   ./install.sh          -- user install (recommended, no sudo needed)
+#   sudo ./install.sh     -- system-wide install
+#   ./install.sh --dev    -- editable install for development
 
 set -e
 
-# Editable / dev install
 if [ "$1" = "--dev" ]; then
     echo "Installing lsf in editable mode..."
-    pip install --editable . --force-reinstall
+    python3 -m pip install --editable . --force-reinstall --break-system-packages
     echo "Done. 'lsf' now reflects live changes to the source."
     exit 0
 fi
 
-PREFIX="${PREFIX:-/usr/local}"
-
-echo "Installing lsf to $PREFIX..."
-
-pip install \
-    --prefix="$PREFIX" \
-    --no-build-isolation \
-    --force-reinstall \
-    .
+if [ "$(id -u)" = "0" ]; then
+    echo "Installing lsf system-wide..."
+    python3 -m pip install --force-reinstall --break-system-packages .
+else
+    echo "Installing lsf for current user..."
+    python3 -m pip install --user --force-reinstall --break-system-packages .
+fi
 
 echo ""
 echo "Done. Run 'lsf' to get started."
 echo ""
-echo "If $PREFIX/bin is not on your PATH, add this to your shell config:"
-echo "  export PATH=\"$PREFIX/bin:\$PATH\""
-echo ""
-echo "Config will be created at ~/.config/lsf/config.toml on first run."
-echo "To customise it beforehand:"
-echo "  mkdir -p ~/.config/lsf"
-echo "  cp config/config.toml.example ~/.config/lsf/config.toml"
+
+# Warn if the user bin directory isn't on PATH
+USER_BIN="$(python3 -m site --user-base)/bin"
+case ":$PATH:" in
+    *":$USER_BIN:"*) ;;
+    *)
+        echo "Note: $USER_BIN is not on your PATH."
+        echo "Add this to your shell config (~/.bashrc, ~/.zshrc, etc.):"
+        echo "  export PATH=\"$USER_BIN:\$PATH\""
+        echo ""
+        ;;
+esac
