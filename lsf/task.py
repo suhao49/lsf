@@ -310,6 +310,13 @@ def schedule_sliced(tasks: list[Task], now: datetime,
         start  = cursor
         end    = add_working_hours(cursor, slice_h)
 
+        # If there's a tiny tail left (< 5 min) after this slice,
+        # absorb it now rather than scheduling a fragment that will
+        # get preempted and pushed far into the future.
+        tail = remaining[chosen.id] - slice_h
+        if 0 < tail < 5/60:
+            slice_h += tail
+            end = add_working_hours(cursor, slice_h)
         slices.append(Slice(chosen, slice_h, start, end))
         remaining[chosen.id] -= slice_h
         # Apply break after slice, clipped to remaining window time.

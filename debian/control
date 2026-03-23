@@ -1,0 +1,24 @@
+Source: lsf
+Section: utils
+Priority: optional
+Maintainer: Nguyen <s02179@bvisvietnam.com>
+Build-Depends: debhelper-compat (= 13),
+               dh-python,
+               python3-all,
+               python3-setuptools,
+               python3-build,
+               python3-installer
+Standards-Version: 4.6.2
+Homepage: https://github.com/suhao49/lsf
+Rules-Requires-Root: no
+
+Package: lsf
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends},
+         python3 (>= 3.9)
+Recommends: python3-tomli
+Description: Least Slack First terminal assignment scheduler
+ lsf schedules assignments by urgency: priority divided by slack,
+ where slack is available working hours before the deadline minus
+ the risk-adjusted estimate. Uses a dynamic time-slice algorithm
+ to interleave tasks optimally across configured working windows.
