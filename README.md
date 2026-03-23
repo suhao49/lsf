@@ -33,7 +33,53 @@ pip install .
 ### Arch Linux
 
 ```sh
-makepkg -si   # from the repo root, requires python-build python-installer python-setuptools
+makepkg -si   # from the repo root
+```
+
+Requires `python-build`, `python-installer`, `python-setuptools`, and `python-wheel`
+from the official repos. The PKGBUILD is included in the repository root.
+
+### Debian / Ubuntu
+
+The `debian/` directory in the repository root contains the packaging files.
+To build a `.deb` locally:
+
+```sh
+# Install build dependencies (one time)
+sudo apt install debhelper dh-python python3-all python3-setuptools \
+                 python3-build python3-installer
+
+# Build the package from the repo root
+dpkg-buildpackage -us -uc -b
+```
+
+This produces a `.deb` file in the parent directory. Install it with:
+
+```sh
+sudo dpkg -i ../lsf_1.0.0-1_all.deb
+```
+
+### Fedora / RHEL / openSUSE
+
+The `lsf.spec` file in the repository root is an RPM spec. To build locally:
+
+```sh
+# Install build dependencies (one time)
+# Fedora/RHEL:
+sudo dnf install python3-devel python3-setuptools python3-build python3-installer rpm-build
+# openSUSE:
+sudo zypper install python3-devel python3-setuptools python3-build python3-installer rpm-build
+
+# Build the RPM from the repo root
+rpmbuild -ba lsf.spec --define "_sourcedir $(pwd)" --define "_rpmdir $(pwd)/dist"
+```
+
+This produces an RPM under `dist/`. Install it with:
+
+```sh
+sudo rpm -i dist/noarch/lsf-1.0.0-1.*.noarch.rpm
+# or with dnf to handle dependencies automatically:
+sudo dnf install dist/noarch/lsf-1.0.0-1.*.noarch.rpm
 ```
 
 ### Development (editable install)
