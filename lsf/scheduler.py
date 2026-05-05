@@ -108,11 +108,17 @@ def load_session() -> dict | None:
         return None
 
 
-def save_session(task_id: str, started_at: str):
+def save_session(task_id: str, started_at: str,
+                 paused_h: float = 0.0, paused_at: str | None = None):
     """Persist the active task timer so lsf done knows what to log."""
     ensure_data_dir()
     with open(SESSION_FILE, "w", encoding="utf-8") as f:
-        json.dump({"task_id": task_id, "started_at": started_at}, f)
+        json.dump({
+            "task_id":    task_id,
+            "started_at": started_at,
+            "paused_h":   paused_h,
+            "paused_at":  paused_at,
+        }, f)
 
 
 def clear_session():
@@ -813,13 +819,18 @@ def main():
     )
     parser.add_argument(
         "command", nargs="?", default="schedule",
-        choices=["schedule", "panic", "import", "start", "done"],
+        choices=["schedule", "panic", "import", "start", "done",
+                 "edit", "pause", "resume", "export"],
         help=(
             "schedule (default) -- interactive schedule; "
             "panic -- survival triage when overloaded; "
             "import -- import tasks from a CSV file; "
             "start -- start a timer for a task (pick by number or id); "
-            "done -- stop timer and log actual elapsed time to task"
+            "done -- stop timer and log actual elapsed time to task; "
+            "edit -- edit a task by number or id; "
+            "pause -- pause the active timer; "
+            "resume -- resume a paused timer; "
+            "export -- write schedule to an .ics calendar file"
         )
     )
     parser.add_argument(
@@ -829,6 +840,10 @@ def main():
     parser.add_argument(
         "--next", action="store_true",
         help="Machine-readable output: print next task name and session minutes, then exit"
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Output full schedule as JSON (tasks, slices, summary) and exit"
     )
     parser.add_argument(
         "-v", "--version", action="store_true",
@@ -933,8 +948,12 @@ def main():
             print(f"  {YELLOW}Session task no longer exists.{RESET}")
             clear_session()
             return
-        started = datetime.fromisoformat(session["started_at"])
-        used_h  = (datetime.now() - started).total_seconds() / 3600
+        started  = datetime.fromisoformat(session["started_at"])
+        paused_h = session.get("paused_h", 0.0)
+        if session.get("paused_at"):
+            paused_since = datetime.fromisoformat(session["paused_at"])
+            paused_h += (datetime.now() - paused_since).total_seconds() / 3600
+        used_h = max((datetime.now() - started).total_seconds() / 3600 - paused_h, 0.0)
         for d in raw:
             if d["id"] == session["task_id"]:
                 d["time_spent"] = round(d.get("time_spent", 0.0) + used_h, 4)
@@ -944,6 +963,77 @@ def main():
         print(f"\n  {GREEN}[x]  Done: {target.name}  "
               f"(+{fmt_hours(used_h)} logged, "
               f"{fmt_hours(d['time_spent'])} total){RESET}\n")
+        return
+
+    # -- lsf pause ----------------------------------------------------
+    if args.command == "pause":
+        session = load_session()
+        if not session:
+            print(f"  {YELLOW}No active session. Run 'lsf start' first.{RESET}")
+            return
+        if session.get("paused_at"):
+            paused_since_p = datetime.fromisoformat(session["paused_at"])
+            paused_min     = round((datetime.now() - paused_since_p).total_seconds() / 60)
+            print(f"  {YELLOW}Already paused ({paused_min}m ago).{RESET}")
+            return
+        raw_p    = load_tasks()
+        tasks_p  = [dict_to_task(d) for d in raw_p]
+        target_p = next((t for t in tasks_p if t.id == session["task_id"]), None)
+        name_p   = target_p.name if target_p else session["task_id"]
+        started_p   = datetime.fromisoformat(session["started_at"])
+        active_h_p  = max(
+            (datetime.now() - started_p).total_seconds() / 3600
+            - session.get("paused_h", 0.0),
+            0.0,
+        )
+        save_session(
+            session["task_id"],
+            session["started_at"],
+            paused_h=session.get("paused_h", 0.0),
+            paused_at=datetime.now().isoformat(),
+        )
+        print(f"\n  {YELLOW}Paused: {name_p}  "
+              f"{DIM}({fmt_hours(active_h_p)} active so far){RESET}")
+        print(f"  {DIM}Run 'lsf resume' to continue.{RESET}\n")
+        return
+
+    # -- lsf resume ---------------------------------------------------
+    if args.command == "resume":
+        session = load_session()
+        if not session:
+            print(f"  {YELLOW}No active session. Run 'lsf start' first.{RESET}")
+            return
+        if not session.get("paused_at"):
+            raw_r    = load_tasks()
+            tasks_r  = [dict_to_task(d) for d in raw_r]
+            target_r = next((t for t in tasks_r if t.id == session["task_id"]), None)
+            name_r   = target_r.name if target_r else session["task_id"]
+            started_r   = datetime.fromisoformat(session["started_at"])
+            active_h_r  = max(
+                (datetime.now() - started_r).total_seconds() / 3600
+                - session.get("paused_h", 0.0),
+                0.0,
+            )
+            print(f"  {YELLOW}Session already running: {name_r} "
+                  f"({fmt_hours(active_h_r)} active).{RESET}")
+            return
+        paused_since_r = datetime.fromisoformat(session["paused_at"])
+        new_paused_h   = (
+            session.get("paused_h", 0.0)
+            + (datetime.now() - paused_since_r).total_seconds() / 3600
+        )
+        save_session(
+            session["task_id"],
+            session["started_at"],
+            paused_h=new_paused_h,
+            paused_at=None,
+        )
+        raw_r2    = load_tasks()
+        tasks_r2  = [dict_to_task(d) for d in raw_r2]
+        target_r2 = next((t for t in tasks_r2 if t.id == session["task_id"]), None)
+        name_r2   = target_r2.name if target_r2 else session["task_id"]
+        print(f"\n  {GREEN}Resumed: {name_r2}{RESET}")
+        print(f"  {DIM}Run 'lsf done' when finished.{RESET}\n")
         return
 
     # -- lsf import [file] --------------------------------------------
@@ -956,6 +1046,174 @@ def main():
             print(f"  {GREEN}[x] Imported {n} new task(s) from {csv_path}{RESET}")
         else:
             print(f"  No new tasks found in {csv_path}")
+        return
+
+    # -- lsf edit [n|id] ----------------------------------------------
+    if args.command == "edit":
+        raw_e   = load_tasks()
+        tasks_e = [dict_to_task(d) for d in raw_e]
+        if not tasks_e:
+            print("  No tasks found.")
+            return
+
+        target_e = None
+        target_raw_e = None
+        if args.file is not None:
+            try:
+                n_e = int(args.file)
+                if 1 <= n_e <= len(tasks_e):
+                    target_e     = tasks_e[n_e - 1]
+                    target_raw_e = raw_e[n_e - 1]
+                else:
+                    print(f"  {RED}Invalid task number. You have {len(tasks_e)} task(s).{RESET}")
+                    return
+            except ValueError:
+                matches_e = [(t, d) for t, d in zip(tasks_e, raw_e)
+                             if t.id.startswith(args.file)]
+                if len(matches_e) == 1:
+                    target_e, target_raw_e = matches_e[0]
+                elif len(matches_e) > 1:
+                    print(f"  {RED}Ambiguous id prefix '{args.file}' -- be more specific.{RESET}")
+                    return
+                else:
+                    print(f"  {RED}No task found with id '{args.file}'.{RESET}")
+                    return
+
+        if target_e is None:
+            print()
+            print(f"  {BOLD}Choose a task to edit:{RESET}")
+            print()
+            for i, t in enumerate(tasks_e, 1):
+                d_icon = DIFF_ICON.get(t.difficulty, "~")
+                stars  = '*' * t.priority
+                spent  = (f"  {DIM}({fmt_hours(t.time_spent)} spent){RESET}"
+                          if t.time_spent > 0 else "")
+                print(f"    {CYAN}{i}.{RESET} {t.name}  "
+                      f"{DIM}{d_icon} {stars} [{t.id}]{RESET}{spent}")
+            print()
+            raw_choice_e = prompt("Task number", "1")
+            try:
+                n_e = int(raw_choice_e)
+                if 1 <= n_e <= len(tasks_e):
+                    target_e     = tasks_e[n_e - 1]
+                    target_raw_e = raw_e[n_e - 1]
+                else:
+                    print(f"  {RED}Invalid number.{RESET}")
+                    return
+            except ValueError:
+                print(f"  {RED}Invalid input.{RESET}")
+                return
+
+        t_e = target_e
+        print()
+        print(f"  {BOLD}Editing: {t_e.name}{RESET}  {DIM}[{t_e.id}]{RESET}")
+        print(f"  {DIM}Press Enter to keep the current value.{RESET}")
+        print()
+
+        new_name = prompt("Name", t_e.name)
+
+        while True:
+            try:
+                raw_due_e = prompt("Due date", fmt_dt(t_e.due))
+                new_due   = (t_e.due if raw_due_e == fmt_dt(t_e.due)
+                             else parse_due_date(raw_due_e))
+                break
+            except ValueError as ex_e:
+                print(f"  {RED}  {ex_e}{RESET}")
+
+        while True:
+            try:
+                raw_est_e    = prompt("Estimate", fmt_hours(t_e.raw_estimate))
+                new_estimate = (t_e.raw_estimate if raw_est_e == fmt_hours(t_e.raw_estimate)
+                                else parse_duration(raw_est_e))
+                break
+            except ValueError:
+                print(f"  {RED}  Could not parse duration.{RESET}")
+
+        print("  Priority levels:")
+        for k, v in PRIORITY_LABELS.items():
+            print(f"    {k} = {v}")
+        while True:
+            try:
+                new_priority = int(prompt("Priority", str(t_e.priority)))
+                if new_priority not in PRIORITY_LABELS:
+                    raise ValueError
+                break
+            except ValueError:
+                print(f"  {RED}  Enter 1-4{RESET}")
+
+        print("  Difficulty levels:")
+        for k, v in DIFFICULTY_LABELS.items():
+            print(f"    {k} = {v}")
+        while True:
+            try:
+                new_difficulty = int(prompt("Difficulty", str(t_e.difficulty)))
+                if new_difficulty not in DIFFICULTY_LABELS:
+                    raise ValueError
+                break
+            except ValueError:
+                print(f"  {RED}  Enter 1-3{RESET}")
+
+        target_raw_e["name"]         = new_name
+        target_raw_e["due"]          = new_due.isoformat()
+        target_raw_e["raw_estimate"] = new_estimate
+        target_raw_e["priority"]     = new_priority
+        target_raw_e["difficulty"]   = new_difficulty
+        save_tasks(raw_e)
+        print()
+        print(f"  {GREEN}[x] Updated: {new_name}{RESET}")
+        return
+
+    # -- lsf export [file.ics] ----------------------------------------
+    if args.command == "export":
+        now_x   = datetime.now()
+        raw_x   = load_tasks()
+        tasks_x = [dict_to_task(d) for d in raw_x]
+        if not tasks_x:
+            print("  No tasks found.")
+            return
+        slices_x, _ = schedule_sliced(tasks_x, now_x)
+        if not slices_x:
+            print("  No sessions to export.")
+            return
+
+        out_path = args.file or os.path.join(os.path.expanduser("~"), "lsf_schedule.ics")
+
+        def _ics_dt(dt: datetime) -> str:
+            return dt.strftime("%Y%m%dT%H%M%S")
+
+        lines_x = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//lsf//Least Slack First//EN",
+            "CALSCALE:GREGORIAN",
+            "METHOD:PUBLISH",
+        ]
+        stamp_x = _ics_dt(now_x)
+        for sx in slices_x:
+            uid_x   = f"lsf-{sx.task.id}-{_ics_dt(sx.start)}@lsf"
+            desc_x  = (
+                f"Difficulty: {DIFF_ICON.get(sx.task.difficulty, '~')}  "
+                f"Priority: {'*' * sx.task.priority}\\n"
+                f"Due: {fmt_dt(sx.task.due)}\\n"
+                f"Remaining: {fmt_hours(sx.task.remaining_estimate)}"
+            )
+            lines_x += [
+                "BEGIN:VEVENT",
+                f"UID:{uid_x}",
+                f"DTSTAMP:{stamp_x}",
+                f"DTSTART:{_ics_dt(sx.start)}",
+                f"DTEND:{_ics_dt(sx.end)}",
+                f"SUMMARY:{sx.task.name}",
+                f"DESCRIPTION:{desc_x}",
+                "END:VEVENT",
+            ]
+        lines_x.append("END:VCALENDAR")
+
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            f.write("\r\n".join(lines_x) + "\r\n")
+
+        print(f"  {GREEN}[x] Exported {len(slices_x)} session(s) to {out_path}{RESET}")
         return
 
     now = datetime.now()
@@ -988,6 +1246,67 @@ def main():
             print(f"{t.name}\n0")
         else:
             print(f"{t.name}\n{dur_min}")
+        return
+
+    # --json: machine-readable full schedule dump (for scripts / dashboards)
+    if args.json:
+        def _task_json(t) -> dict:
+            return {
+                "id":                   t.id,
+                "name":                 t.name,
+                "due":                  t.due.isoformat(),
+                "raw_estimate_h":       t.raw_estimate,
+                "adjusted_estimate_h":  t.adjusted_estimate,
+                "remaining_estimate_h": t.remaining_estimate,
+                "time_spent_h":         t.time_spent,
+                "priority":             t.priority,
+                "difficulty":           t.difficulty,
+                "slack_h":              t.slack,
+                "urgency":              t.raw_urgency,
+                "overloaded":           t.overloaded,
+                "will_be_late":         t.will_be_late,
+                "finish_time":          t.finish_time.isoformat(),
+            }
+        def _slice_json(s) -> dict:
+            return {
+                "task_id":      s.task.id,
+                "task_name":    s.task.name,
+                "start":        s.start.isoformat(),
+                "end":          s.end.isoformat(),
+                "duration_min": round(s.duration_h * 60),
+                "will_be_late": s.will_be_late,
+            }
+        active_ses  = load_session()
+        active_info = None
+        if active_ses:
+            started_j   = datetime.fromisoformat(active_ses["started_at"])
+            ph_j        = active_ses.get("paused_h", 0.0)
+            if active_ses.get("paused_at"):
+                ph_j += (datetime.now() -
+                         datetime.fromisoformat(active_ses["paused_at"])
+                         ).total_seconds() / 3600
+            active_h_j  = max(
+                (datetime.now() - started_j).total_seconds() / 3600 - ph_j, 0.0
+            )
+            active_info = {
+                "task_id":    active_ses["task_id"],
+                "started_at": active_ses["started_at"],
+                "paused_at":  active_ses.get("paused_at"),
+                "active_h":   round(active_h_j, 4),
+            }
+        total_rem_j = sum(t.remaining_estimate for t in ordered)
+        print(json.dumps({
+            "as_of":          now.isoformat(),
+            "active_session": active_info,
+            "tasks":          [_task_json(t) for t in ordered],
+            "slices":         [_slice_json(s) for s in slices],
+            "summary": {
+                "task_count":        len(ordered),
+                "slice_count":       len(slices),
+                "total_remaining_h": total_rem_j,
+                "any_overloaded":    any(t.overloaded for t in ordered),
+            },
+        }, indent=2))
         return
 
     # panic mode: only available when the scheduler detects overload

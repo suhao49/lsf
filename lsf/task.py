@@ -20,6 +20,7 @@ BREAK_H               = CFG['break_h']
 SLICE_H               = CFG['slice_h']
 SWITCH_URGENCY_PENALTY = CFG['switch_urgency_penalty']
 URGENCY_SLACK_FLOOR   = CFG['urgency_slack_floor_h']
+URGENCY_BAND_PCT      = CFG['urgency_band_pct']
 EPSILON               = 0.01
 
 
@@ -299,10 +300,14 @@ def schedule_sliced(tasks: list[Task], now: datetime,
             # restore so task object still reflects original for display
             t.remaining_estimate = orig
 
-        # Pick by raw_urgency so overloaded tasks compete on the same scale.
-        # The slice scheduler's job is to interleave optimally -- the overloaded
-        # flag is for display only, not for scheduling priority.
-        chosen = max(active, key=lambda t: t.raw_urgency)
+        # Urgency banding: tasks within URGENCY_BAND_PCT of the top urgency
+        # compete as a group; within the group prefer least remaining work.
+        # This prevents a task with marginally higher urgency from monopolising
+        # every slice -- small urgent tasks push through naturally.
+        max_urg    = max(t.raw_urgency for t in active)
+        band_floor = max_urg * (1.0 - URGENCY_BAND_PCT)
+        band       = [t for t in active if t.raw_urgency >= band_floor]
+        chosen     = min(band, key=lambda t: remaining[t.id])
 
         # Slice size: min(difficulty slice, what's left)
         slice_h = min(SLICE_H[chosen.difficulty], remaining[chosen.id])

@@ -60,6 +60,12 @@ switch_urgency_penalty = 0.85
 # Prevents urgency spikes when a task is almost exactly on time
 urgency_slack_floor_h  = 0.25
 
+# Urgency banding: tasks within this fraction of the top urgency form a group.
+# Within that group the task with least remaining work is picked first, so
+# small urgent tasks push through rather than every task clumping in order.
+# 0.0 = pure LSF (strict ordering), 0.20 = 20% band is a good default.
+urgency_band_pct       = 0.20
+
 # Burndown forecast caps (hours of each type per day)
 deep_cap_per_day   = 4.0
 medium_cap_per_day = 6.0
@@ -207,6 +213,7 @@ def load_config() -> dict:
     slice_deep       = float(defaults.get("slice_deep_min", 90))
     switch_urg_pen   = float(defaults.get("switch_urgency_penalty", 0.85))
     slack_floor      = float(defaults.get("urgency_slack_floor_h", 0.25))
+    band_pct         = float(defaults.get("urgency_band_pct", 0.20))
     deep_cap         = float(defaults.get("deep_cap_per_day", 4.0))
     medium_cap       = float(defaults.get("medium_cap_per_day", 6.0))
     wins_weekday     = parse_windows("weekday")
@@ -253,6 +260,7 @@ def load_config() -> dict:
         },
         "switch_urgency_penalty": switch_urg_pen,
         "urgency_slack_floor_h":  slack_floor,
+        "urgency_band_pct":       band_pct,
         "deep_cap_per_day":       deep_cap,
         "medium_cap_per_day":     medium_cap,
         "total_day_h_weekday":    total_h_for_day(0),  # Monday as representative weekday
