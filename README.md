@@ -99,10 +99,18 @@ lsf start                # start a timer for a task
 lsf start 2              # start a timer for task 2 directly
 lsf start a1b2           # start a timer by task id prefix
 lsf done                 # stop timer and log elapsed time
+lsf pause                # pause the active timer
+lsf resume               # resume a paused timer
+lsf edit                 # edit a task (prompts for task number)
+lsf edit 2               # edit task 2 directly
+lsf edit a1b2            # edit by task id prefix
 lsf panic                # survival triage (only available when overloaded)
 lsf import tasks.csv     # import assignments from a CSV file
 lsf import               # import from the data dir hot-folder
+lsf export               # export schedule to ~/lsf_schedule.ics
+lsf export schedule.ics  # export to a specific path
 lsf --next               # machine-readable next task (for status bars)
+lsf --json               # full schedule as JSON (tasks, slices, summary)
 lsf -v                   # print version and exit
 ```
 
@@ -144,6 +152,9 @@ switch_urgency_penalty = 0.85  # multiplier on urgency of a different task (0–
                                 # lower = stronger preference for continuing current task
 urgency_slack_floor_h  = 0.25  # minimum effective slack in urgency calculation (hours)
                                 # prevents urgency spikes near zero slack
+urgency_band_pct       = 0.20  # tasks within this fraction of top urgency compete as a group;
+                                # within the band the shortest task is picked first
+                                # 0.0 = pure LSF, 0.20 = 20% band
 
 # ── Burndown display ──────────────────────────────────────────────────────────
 deep_cap_per_day   = 4.0   # assumed max deep work hours per day (burndown forecast)
@@ -214,17 +225,43 @@ Difficulty: `1` light · `2` medium · `3` deep
 
 ## Session tracking
 
-`lsf start` starts a timer for any task. `lsf done` stops it and logs the actual
-elapsed time to that task's `time_spent` field.
+`lsf start` starts a timer for any task. `lsf done` stops it and logs actual working time.
 
 ```sh
 lsf start        # shows your tasks and prompts you to pick one
 lsf start 2      # start by task number
 lsf start a1b2   # start by task id prefix
+lsf pause        # pause the timer (paused wall time is not counted)
+lsf resume       # resume after a pause
 lsf done         # stop and log however long it actually took
 ```
 
 If a session is already running, `lsf start` will warn you before overwriting it.
+Paused time is automatically excluded from the logged duration — only actual working time counts.
+
+## Editing tasks
+
+`lsf edit` lets you change any field of an existing task without touching `tasks.json` directly.
+
+```sh
+lsf edit         # shows task list and prompts for a number
+lsf edit 2       # edit task 2 directly
+lsf edit a1b2    # edit by task id prefix
+```
+
+Press Enter at any prompt to keep the current value.
+
+## Calendar export
+
+`lsf export` writes the full slice schedule as a standard `.ics` file
+
+```sh
+lsf export                   # exports to ~/lsf_schedule.ics
+lsf export ~/Desktop/lsf.ics # export to a custom path
+```
+
+Session UIDs are derived from task id + start time, so re-exporting updates existing
+events instead of creating duplicates.
 
 ## Breaks
 
@@ -239,13 +276,25 @@ clipped to the remaining window time and never push past a window boundary:
 
 Set `break_min = 0` to disable. Panic mode always ignores breaks.
 
-## fastfetch integration
+## Machine-readable output
 
 `lsf --next` prints two lines: the task name, then the session length in minutes
 (or `0` if overloaded). Wire it into fastfetch:
 
 ```jsonc
 { "type": "command", "key": "Next task", "text": "lsf --next" }
+```
+
+`lsf --json` outputs the full schedule as JSON
+
+```json
+{
+  "as_of": "2025-03-15T14:22:00",
+  "active_session": { "task_id": "a1b2c3d4", "started_at": "...", "active_h": 0.5 },
+  "tasks": [ { "id": "...", "name": "...", "slack_h": 3.2, ... } ],
+  "slices": [ { "task_id": "...", "start": "...", "end": "...", "duration_min": 60 } ],
+  "summary": { "task_count": 3, "total_remaining_h": 7.4, "any_overloaded": false }
+}
 ```
 
 ## Panic mode
