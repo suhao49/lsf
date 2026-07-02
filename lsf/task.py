@@ -271,7 +271,8 @@ def schedule(tasks: list[Task], now: datetime) -> list[Task]:
 # -- Dynamic LSF time-slice scheduler -----------------------------------------
 
 def schedule_sliced(tasks: list[Task], now: datetime,
-                    break_h: float | None = None) -> tuple[list[Slice], list[Task]]:
+                    break_h: float | None = None,
+                    start_after: datetime | None = None) -> tuple[list[Slice], list[Task]]:
     """
     Dynamic Least-Slack-First scheduler with time slicing.
 
@@ -293,6 +294,10 @@ def schedule_sliced(tasks: list[Task], now: datetime,
     break_h parameter: override break length (pass 0.0 to disable, e.g. for panic mode).
     Defaults to the configured break_h from config.toml.
 
+    start_after: earliest moment the first slice may begin (used to honour the
+    rest break after a just-logged work session). Slack and per-task stats are
+    still computed from `now`.
+
     Returns:
         slices     -- ordered list of Slice objects (the session plan)
         tasks      -- the original task list with finish_time / will_be_late set
@@ -308,7 +313,8 @@ def schedule_sliced(tasks: list[Task], now: datetime,
     remaining = {t.id: t.remaining_estimate for t in tasks}
 
     slices:   list[Slice] = []
-    cursor    = _snap_to_next_window(now)
+    first_at  = now if start_after is None else max(now, start_after)
+    cursor    = _snap_to_next_window(first_at)
     prev_id:  str | None  = None
     # Window clipping can produce more slices than remaining/slice_h alone
     # (each short window adds one), so cap on the finest granularity.
@@ -369,18 +375,20 @@ def schedule_sliced(tasks: list[Task], now: datetime,
         end    = add_working_hours(cursor, slice_h)
 
         # If there's a tiny tail left (< 5 min) after this slice,
-        # absorb it now rather than scheduling a fragment that will
-        # get preempted and pushed far into the future.
+        # absorb it now rather than scheduling a fragment later --
+        # but only if the extended slice still fits the current window.
         tail = remaining[chosen.id] - slice_h
-        if 0 < tail < 5/60:
+        if 0 < tail < 5/60 and slice_h + tail <= win_left + 1e-9:
             slice_h += tail
             end = add_working_hours(cursor, slice_h)
         slices.append(Slice(chosen, slice_h, start, end))
         remaining[chosen.id] -= slice_h
         # Apply break after slice, clipped to remaining window time.
         # Breaks never push the cursor past a window boundary -- the next
-        # slice picks up at the next window start naturally.
-        if break_h > 0 and remaining[chosen.id] > 1e-6:
+        # slice picks up at the next window start naturally. The break applies
+        # whenever any work follows, including when the next slice belongs to
+        # a different task (finishing one task doesn't skip the rest).
+        if break_h > 0 and any(remaining[t.id] > 1e-6 for t in tasks):
             win_left = _remaining_in_window(end)
             actual_break = min(break_h, win_left)
             if actual_break > 0:

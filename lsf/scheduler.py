@@ -48,6 +48,7 @@ DATA_FILE        = os.path.join(DATA_DIR, "tasks.json")
 CSV_FILE         = os.path.join(DATA_DIR, "import.csv")
 SESSION_FILE     = os.path.join(DATA_DIR, "session.json")
 HISTORY_FILE     = os.path.join(DATA_DIR, "done.json")
+STATE_FILE       = os.path.join(DATA_DIR, "state.json")
 DEFAULT_ICS_PATH = os.path.join(os.path.expanduser("~"), "lsf_schedule.ics")
 
 PRIORITY_LABELS = {
@@ -126,6 +127,36 @@ def save_session(task_id: str, started_at: str,
 def clear_session():
     if os.path.exists(SESSION_FILE):
         os.remove(SESSION_FILE)
+
+
+def mark_session_end(end: datetime):
+    """Remember when the last logged work session ended, so the next
+    schedule starts after a rest break instead of immediately."""
+    ensure_data_dir()
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"last_session_end": end.isoformat()}, f)
+
+
+def resume_after_break(now: datetime) -> datetime | None:
+    """
+    Earliest moment the next work slice may start, or None for no constraint.
+
+    Returns last_session_end + break_min when a session was logged less than
+    a break ago and no session is currently running (an active timer means
+    you chose to work through, so the schedule should not be shifted).
+    """
+    if BREAK_H <= 0 or load_session() is not None:
+        return None
+    if not os.path.exists(STATE_FILE):
+        return None
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        last_end = datetime.fromisoformat(state["last_session_end"])
+    except (json.JSONDecodeError, IOError, KeyError, ValueError):
+        return None
+    until = last_end + timedelta(hours=BREAK_H)
+    return until if until > now else None
 
 
 def load_history() -> list[dict]:
@@ -536,6 +567,11 @@ def display(tasks: list[Task], slices: list[Slice], now: datetime):
         if t.overloaded:
             print(f"  {BOLD}Start now:{RESET}  "
                   f"{RED}OVERLOADED -- negotiate deadline or cut scope{RESET}")
+        elif in_window and first.start > now + timedelta(minutes=1):
+            # First slice deferred past now -- resting after a logged session
+            print(f"  {BOLD}On break:{RESET}  "
+                  f"{YELLOW}until {first.start:%H:%M}{RESET}  "
+                  f"{DIM}then ▶ {t.name}  ({dur} min){RESET}")
         elif in_window:
             print(f"  {BOLD}Start now:{RESET}  "
                   f"{GREEN}{BOLD}▶ {t.name}{RESET}  {DIM}({dur} min){RESET}")
@@ -1110,6 +1146,7 @@ def main():
                 break
         save_tasks(raw)
         clear_session()
+        mark_session_end(datetime.now())
         print(f"\n  {GREEN}[x]  Done: {target.name}  "
               f"(+{fmt_hours(used_h)} logged, "
               f"{fmt_hours(d['time_spent'])} total){RESET}\n")
@@ -1401,7 +1438,8 @@ def main():
         if not tasks_x:
             print("  No tasks found.")
             return
-        slices_x, _ = schedule_sliced(tasks_x, now_x)
+        slices_x, _ = schedule_sliced(tasks_x, now_x,
+                                      start_after=resume_after_break(now_x))
         if not slices_x:
             print("  No sessions to export.")
             return
@@ -1426,7 +1464,9 @@ def main():
     if not tasks and args.next:
         return   # nothing to report to fastfetch
 
-    slices, ordered = schedule_sliced(tasks, now) if tasks else ([], [])
+    slices, ordered = (schedule_sliced(tasks, now,
+                                       start_after=resume_after_break(now))
+                       if tasks else ([], []))
 
     # --next: machine-readable output for fastfetch / status bars
     # Uses the first slice so the session length matches the sliced plan
@@ -1565,7 +1605,8 @@ def main():
         save_tasks([task_to_dict(t) for t in tasks])
         print(f"  {DIM}Saved to {DATA_FILE}{RESET}")
         print()
-        slices, ordered = schedule_sliced(tasks, now)   # re-run after changes
+        slices, ordered = schedule_sliced(                # re-run after changes
+            tasks, now, start_after=resume_after_break(now))
 
     display(ordered, slices, now)
 

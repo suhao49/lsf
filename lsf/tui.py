@@ -35,7 +35,7 @@ from .task import (
 from .scheduler import (
     load_tasks, save_tasks, load_session, save_session, clear_session,
     import_csv, dict_to_task, export_ics, new_task_dict,
-    archive_task, pop_history,
+    archive_task, pop_history, mark_session_end, resume_after_break,
     PRIORITY_LABELS, DIFFICULTY_LABELS, DIFF_ICON, DEFAULT_ICS_PATH,
 )
 from .util import fmt_hours, fmt_dt, parse_due_date, parse_duration
@@ -369,6 +369,7 @@ class LsfApp(App):
         self._alert_session_key: str | None = None
         self._alert_k                        = 0
         self._pause_alert_done:  str | None = None
+        self._on_break                       = False
 
     # -- Layout ----------------------------------------------------------------
 
@@ -404,7 +405,8 @@ class LsfApp(App):
         now = datetime.now()
         self.tasks = [dict_to_task(d) for d in self.raw]
         if self.tasks:
-            self.slices, _ = schedule_sliced(self.tasks, now)
+            self.slices, _ = schedule_sliced(
+                self.tasks, now, start_after=resume_after_break(now))
         else:
             self.slices = []
 
@@ -653,9 +655,26 @@ class LsfApp(App):
         now  = datetime.now()
         self._check_session_alerts(session, now)
         if not session:
+            brk = resume_after_break(now)
+            if brk is not None:
+                left = max(int((brk - now).total_seconds()), 0)
+                self._on_break = True
+                panel.update(f"[bold]Timer[/]\n"
+                             f"[yellow]On break -- {left // 60}:{left % 60:02d} "
+                             f"left (until {brk:%H:%M})[/]\n"
+                             f"[dim]s starts the next task early[/]")
+                return
+            if self._on_break:
+                # Break just finished -- reflow the plan back to 'start now'
+                self._on_break = False
+                self.bell()
+                self.notify("Break over -- ready for the next session.",
+                            title="lsf", timeout=10)
+                self.refresh_schedule()
             panel.update("[bold]Timer[/]\n[dim]No active session. "
                          "Select a task and press [bold]s[/bold] to start.[/]")
             return
+        self._on_break = False
         t    = next((x for x in self.tasks if x.id == session["task_id"]), None)
         name = escape(t.name) if t else session["task_id"]
         h    = _session_elapsed_h(session, now)
@@ -710,6 +729,7 @@ class LsfApp(App):
             session = load_session()
             if session and session.get("task_id") == t.id:
                 clear_session()
+                mark_session_end(datetime.now())
             d = self.raw_for(t)
             if d is not None:
                 archive_task(d)
@@ -736,13 +756,15 @@ class LsfApp(App):
         if session:
             used_h = _session_elapsed_h(session, now)
             d = next((x for x in self.raw if x["id"] == session["task_id"]), None)
+            clear_session()
+            mark_session_end(now)
             if d is not None:
                 d["time_spent"] = round(d.get("time_spent", 0.0) + used_h, 4)
-                self.persist()
-                clear_session()
-                self.notify(f"Logged {fmt_hours(used_h)} on {d['name']}")
+                self.persist()   # after clear_session so the break shift applies
+                self.notify(f"Logged {fmt_hours(used_h)} on {d['name']} "
+                            f"-- break time")
             else:
-                clear_session()
+                self.refresh_schedule()
                 self.notify("Session task no longer exists.", severity="warning")
             self.refresh_timer()
             return

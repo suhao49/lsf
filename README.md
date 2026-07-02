@@ -334,6 +334,11 @@ clipped to the remaining window time and never push past a window boundary:
 20:40 → 21:30  Composition draft  * 50m
 ```
 
+Breaks also apply when one task finishes and another begins, and after real
+work: stopping a timer (`lsf done` or `s` in the TUI) holds the next scheduled
+session back until `break_min` has passed since you stopped. The TUI timer
+panel shows a break countdown; starting a new timer skips the break.
+
 Set `break_min = 0` to disable. Panic mode always ignores breaks.
 
 ## Machine-readable output
