@@ -2,6 +2,7 @@
 lsf.util -- input parsers and display formatters.
 """
 
+import re
 from datetime import datetime, timedelta, date
 
 RED    = "\033[91m"
@@ -20,16 +21,74 @@ def prompt(text: str, default: str = "") -> str:
     return val if val else default
 
 
+_WEEKDAYS = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
+
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    h, m = map(int, s.split(":"))
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError(f"invalid time '{s}'")
+    return h, m
+
+
 def parse_due_date(raw: str) -> datetime:
+    """
+    Accepted forms:
+        tonight / eod                 today 22:00
+        today [HH:MM]                 defaults 23:59
+        tomorrow [HH:MM]              defaults 23:59
+        friday [HH:MM]                next occurrence of that weekday
+        next mon [HH:MM]              one week after the next occurrence
+        +3d / +2w [HH:MM]             relative days / weeks from today
+        25/03 [HH:MM]                 next 25th of March (rolls to next year if past)
+        25/03/2026 [HH:MM]            explicit
+        2026-03-25 [HH:MM]            ISO
+    """
     raw = raw.strip().lower()
     now = datetime.now()
     if raw in ("tonight", "eod", "end of day"):
         return now.replace(hour=22, minute=0, second=0, microsecond=0)
-    if raw.startswith("tomorrow"):
-        parts     = raw.split()
-        time_part = parts[1] if len(parts) > 1 else "23:59"
-        h, m      = map(int, time_part.split(":"))
-        return (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+
+    tokens = raw.split()
+
+    if tokens and tokens[0] in ("today", "tomorrow"):
+        h, m = _parse_hhmm(tokens[1]) if len(tokens) > 1 else (23, 59)
+        base = now if tokens[0] == "today" else now + timedelta(days=1)
+        return base.replace(hour=h, minute=m, second=0, microsecond=0)
+
+    # Weekday names: 'friday', 'fri 18:00', 'next mon 18:00'
+    next_week = False
+    day_tokens = tokens
+    if len(tokens) >= 2 and tokens[0] == "next":
+        next_week  = True
+        day_tokens = tokens[1:]
+    if day_tokens and day_tokens[0] in _WEEKDAYS:
+        h, m   = _parse_hhmm(day_tokens[1]) if len(day_tokens) > 1 else (23, 59)
+        ahead  = (_WEEKDAYS[day_tokens[0]] - now.weekday()) % 7
+        result = (now + timedelta(days=ahead)).replace(
+            hour=h, minute=m, second=0, microsecond=0)
+        if ahead == 0 and result <= now:
+            result += timedelta(days=7)
+        if next_week:
+            result += timedelta(days=7)
+        return result
+
+    # Relative offsets: '+3d', '+2w 18:00'
+    m_rel = re.fullmatch(r"\+(\d+)\s*([dw])(?:\s+(\d{1,2}:\d{2}))?", raw)
+    if m_rel:
+        n, unit, time_part = m_rel.groups()
+        days = int(n) * (7 if unit == "w" else 1)
+        h, m = _parse_hhmm(time_part) if time_part else (23, 59)
+        return (now + timedelta(days=days)).replace(
+            hour=h, minute=m, second=0, microsecond=0)
 
     # Year-bearing formats first (no ambiguity)
     for fmt in ["%d/%m/%Y %H:%M", "%d/%m/%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"]:
@@ -38,7 +97,8 @@ def parse_due_date(raw: str) -> datetime:
         except ValueError:
             continue
 
-    # Yearless formats -- inject current year to avoid Python 3.15 deprecation warning
+    # Yearless formats -- inject current year, rolling to next year if the
+    # result is already past (typing '05/01' in December means next January).
     yearless = [("%d/%m %H:%M", "%d/%m/%Y %H:%M"),
                 ("%d/%m",       "%d/%m/%Y")]
     for src_fmt, dst_fmt in yearless:
@@ -49,11 +109,16 @@ def parse_due_date(raw: str) -> datetime:
         parts      = raw.split()
         date_token = parts[0]
         rest       = " ".join(parts[1:])
-        injected   = f"{date_token}/{now.year} {rest}".strip()
-        try:
-            return datetime.strptime(injected, dst_fmt)
-        except ValueError:
-            continue
+        for year in (now.year, now.year + 1):
+            injected = f"{date_token}/{year} {rest}".strip()
+            try:
+                result = datetime.strptime(injected, dst_fmt)
+            except ValueError:
+                continue    # e.g. 29/02 in a non-leap year
+            if result >= now or year > now.year:
+                return result
+        # both years parsed but current-year result was past and next-year
+        # failed (unreachable in practice) -- fall through to error
 
     raise ValueError(f"Could not parse date: '{raw}'")
 

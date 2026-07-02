@@ -52,6 +52,10 @@ slice_light_min    = 30    # difficulty 1 -- reading, MCQ, admin
 slice_medium_min   = 60    # difficulty 2 -- problem sets, short writing
 slice_deep_min     = 90    # difficulty 3 -- essays, coding, creative work
 
+# Shortest slice worth scheduling (minutes). Window tails shorter than this
+# are left free instead of being filled with an unusable fragment.
+min_slice_min      = 10
+
 # How strongly to favour continuing the current task vs switching
 # 1.0 = no preference, 0.0 = never switch, 0.85 is a good default
 switch_urgency_penalty = 0.85
@@ -211,6 +215,7 @@ def load_config() -> dict:
     slice_light      = float(defaults.get("slice_light_min", 30))
     slice_medium     = float(defaults.get("slice_medium_min", 60))
     slice_deep       = float(defaults.get("slice_deep_min", 90))
+    min_slice        = float(defaults.get("min_slice_min", 10))
     switch_urg_pen   = float(defaults.get("switch_urgency_penalty", 0.85))
     slack_floor      = float(defaults.get("urgency_slack_floor_h", 0.25))
     band_pct         = float(defaults.get("urgency_band_pct", 0.20))
@@ -258,6 +263,7 @@ def load_config() -> dict:
             2: slice_medium / 60,
             3: slice_deep   / 60,
         },
+        "min_slice_h":            min_slice / 60,
         "switch_urgency_penalty": switch_urg_pen,
         "urgency_slack_floor_h":  slack_floor,
         "urgency_band_pct":       band_pct,

@@ -15,7 +15,8 @@ Rules-Requires-Root: no
 Package: lsf
 Architecture: all
 Depends: ${python3:Depends}, ${misc:Depends},
-         python3 (>= 3.9)
+         python3 (>= 3.9),
+         python3-textual
 Recommends: python3-tomli
 Description: Least Slack First terminal assignment scheduler
  lsf schedules assignments by urgency: priority divided by slack,

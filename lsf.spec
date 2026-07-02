@@ -11,6 +11,7 @@ BuildRequires:  python3-setuptools
 BuildRequires:  python3-build
 BuildRequires:  python3-installer
 
+Requires:       python3-textual
 # tomli only needed on Python < 3.11
 %if 0%{?python3_version_nodots} < 311
 Requires:       python3-tomli

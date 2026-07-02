@@ -93,8 +93,40 @@ Changes to the source take effect immediately without reinstalling.
 
 ## Usage
 
+Running `lsf` with no arguments opens the full-screen terminal interface:
+
+```
+┌─ Today's plan ──────────────┐┌─ Tasks ─────────────────────────────┐
+│ -- 19:30-21:30 (2h00m) --   ││  #  Task            Due   Left Slack│
+│  19:30 -> 20:30  Essay      ││  1  Essay           today  3h   +2h │
+│  20:30 -> 20:40  (break 10m)││  2  Problem set 4   tmrw   1h   +9h │
+│  20:40 -> 21:30  Essay      ││                                     │
+└─────────────────────────────┘└─────────────────────────────────────┘
+┌─ Timer ─────────────────────┐┌─ Details ───────────────────────────┐
+│ > Essay  00:23:41           ││ Essay  [a1b2c3d4]                   │
+│ s to stop & log · p to pause││ Remaining 3h · slack +2h · on track │
+└─────────────────────────────┘└─────────────────────────────────────┘
+ 2 task(s) · remaining 4h · pace 2h/day over 2.0 working days
+ a Add  e Edit  d Done  s Start/stop  p Pause  x Export  q Quit
+```
+
+Keys: `a` add task · `e` edit · `d` mark done · `u` undo · `s` start/stop timer ·
+`p` pause/resume · `x` export .ics · `shift+p` panic triage · `r` reload · `q` quit.
+
+While a timer is running the TUI rings the terminal bell and shows a
+notification when you have worked a full slice ("time for a break") and when
+a pause has lasted longer than `break_min` ("break over").
+
+The timer, schedule, and task data are shared with the CLI commands below, so
+you can mix and match freely (e.g. start a timer in the TUI, stop it with
+`lsf done` later).
+
 ```sh
-lsf                      # interactive schedule (default)
+lsf                      # full-screen TUI (default)
+lsf schedule             # classic prompt-based schedule
+lsf add "Essay" --est 2h --due "friday 18:00" -p 3 -d 3   # non-interactive add
+lsf undo                 # restore the most recently completed task
+lsf history              # completed tasks with estimated vs actual time
 lsf start                # start a timer for a task
 lsf start 2              # start a timer for task 2 directly
 lsf start a1b2           # start a timer by task id prefix
@@ -141,6 +173,8 @@ risk_multiplier    = 1.4   # raw estimates are multiplied by this (Hofstadter bu
 slice_light_min    = 30    # session length for difficulty 1 tasks (reading, MCQ, admin)
 slice_medium_min   = 60    # session length for difficulty 2 tasks (problem sets, writing)
 slice_deep_min     = 90    # session length for difficulty 3 tasks (essays, coding)
+min_slice_min      = 10    # shortest slice worth scheduling; smaller window
+                           # tails are left free instead of getting a fragment
 
 # ── Breaks ────────────────────────────────────────────────────────────────────
 break_min          = 10    # rest shown between slices in timetable; 0 to disable
@@ -222,6 +256,32 @@ Problem set,24/03 08:00,1h30m,2,2
 
 Priority: `1` low · `2` medium · `3` high · `4` critical  
 Difficulty: `1` light · `2` medium · `3` deep
+
+## Date formats
+
+Anywhere a due date is asked for (TUI form, `lsf add --due`, `lsf edit`, CSV):
+
+| Input | Meaning |
+|---|---|
+| `tonight` / `eod` | today 22:00 |
+| `today 18:00` | today at 18:00 (time defaults to 23:59) |
+| `tomorrow 08:00` | tomorrow at 08:00 |
+| `friday`, `fri 18:00` | next occurrence of that weekday |
+| `next mon 18:00` | one week after the next Monday |
+| `+3d`, `+2w 09:30` | 3 days / 2 weeks from today |
+| `25/03 10:00` | next 25th of March — rolls to next year if already past |
+| `25/03/2027 10:00` | explicit day/month/year |
+| `2027-03-25 10:00` | ISO format |
+
+## Completion history & undo
+
+Marking a task done (TUI `d`, or the "mark done" prompt) archives it to
+`done.json` in the data directory instead of deleting it.
+
+```sh
+lsf history   # completed tasks, estimated vs actual time (when timers were used)
+lsf undo      # restore the most recently completed task (TUI: press u)
+```
 
 ## Session tracking
 
@@ -316,8 +376,13 @@ Optimal session plan timetable for the achievable tasks only
 
 ## Requirements
 
-Python 3.9+. No external dependencies on Python 3.11+.  
-On Python < 3.11, install [`tomli`](https://pypi.org/project/tomli/): `pip install tomli`
+Python 3.9+ and [`textual`](https://textual.textualize.io/) (installed
+automatically by pip; packaged as `python-textual` / `python3-textual` in
+distro repos) for the full-screen interface.  
+On Python < 3.11, also install [`tomli`](https://pypi.org/project/tomli/): `pip install tomli`
+
+If `textual` is not available, `lsf` falls back to the classic prompt-based
+interface — the scheduler itself has no external dependencies on Python 3.11+.
 
 ## How it works
 
@@ -325,6 +390,17 @@ Tasks are scheduled using a dynamic Least Slack First time-slice algorithm. Inst
 of sorting tasks once, the scheduler repeatedly picks the most urgent task, works one
 slice, then re-evaluates priorities. This prevents large low-urgency tasks from
 blocking small urgent ones. Slice lengths are configurable per difficulty level.
+
+Slices are window-aware: among tasks competing in the urgency band, ones whose
+slice fits the remaining time in the current window are preferred, so short
+windows (a 20-minute recess) get short work instead of splitting a deep session
+across a gap. When nothing fits naturally the winning task's slice is clipped to
+the window boundary, and window tails shorter than `min_slice_min` are left free.
+
+Every schedule also runs a silent EDF feasibility check. If some cluster of
+deadlines cannot all be met even under optimal ordering — before any aggregate
+overload is visible — a `DEADLINE RISK` warning appears and `lsf panic` becomes
+available for triage.
 
 ```
 urgency = priority / max(slack, urgency_slack_floor_h)

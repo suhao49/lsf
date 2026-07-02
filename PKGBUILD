@@ -6,7 +6,7 @@ pkgdesc="Least Slack First -- terminal assignment scheduler"
 arch=('any')
 url="https://github.com/suhao49/lsf"
 license=('MIT')
-depends=('python>=3.9')
+depends=('python>=3.9' 'python-textual')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 # tomli only needed on Python < 3.11; python-tomli is in the AUR/extra
 # Arch ships Python 3.11+ so this is effectively never needed, but listed for correctness

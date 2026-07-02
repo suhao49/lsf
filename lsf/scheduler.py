@@ -43,10 +43,12 @@ def _default_data_dir() -> str:
         return os.path.expanduser("~/Library/Application Support/lsf")
     return os.path.expanduser("~/.lsf")          # Linux
 
-DATA_DIR      = _default_data_dir()
-DATA_FILE     = os.path.join(DATA_DIR, "tasks.json")
-CSV_FILE      = os.path.join(DATA_DIR, "import.csv")
-SESSION_FILE  = os.path.join(DATA_DIR, "session.json")
+DATA_DIR         = _default_data_dir()
+DATA_FILE        = os.path.join(DATA_DIR, "tasks.json")
+CSV_FILE         = os.path.join(DATA_DIR, "import.csv")
+SESSION_FILE     = os.path.join(DATA_DIR, "session.json")
+HISTORY_FILE     = os.path.join(DATA_DIR, "done.json")
+DEFAULT_ICS_PATH = os.path.join(os.path.expanduser("~"), "lsf_schedule.ics")
 
 PRIORITY_LABELS = {
     1: "low      (homework / reading)",
@@ -126,6 +128,94 @@ def clear_session():
         os.remove(SESSION_FILE)
 
 
+def load_history() -> list[dict]:
+    """Completed-task archive, oldest first."""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def save_history(history: list[dict]):
+    ensure_data_dir()
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, default=str)
+
+
+def archive_task(d: dict):
+    """Move a completed task record into done.json with a completion stamp."""
+    history = load_history()
+    entry   = dict(d)
+    entry["completed_at"] = datetime.now().isoformat()
+    history.append(entry)
+    save_history(history)
+
+
+def pop_history() -> dict | None:
+    """Remove and return the most recently completed task (for undo)."""
+    history = load_history()
+    if not history:
+        return None
+    entry = history.pop()
+    save_history(history)
+    entry.pop("completed_at", None)
+    return entry
+
+
+def new_task_dict(name: str, due: str, raw_estimate: float,
+                  priority: int, difficulty: int = 2) -> dict:
+    """Build a fresh task record (due is an ISO datetime string)."""
+    return {
+        "id":           str(uuid.uuid4())[:8],
+        "name":         name,
+        "due":          due,
+        "raw_estimate": raw_estimate,
+        "priority":     priority,
+        "difficulty":   difficulty,
+        "time_spent":   0.0,
+    }
+
+
+def export_ics(slices: list, out_path: str, now: datetime) -> int:
+    """Write the slice schedule to an .ics file. Returns the event count."""
+    def _ics_dt(dt: datetime) -> str:
+        return dt.strftime("%Y%m%dT%H%M%S")
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//lsf//Least Slack First//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+    ]
+    stamp = _ics_dt(now)
+    for s in slices:
+        desc = (
+            f"Difficulty: {DIFF_ICON.get(s.task.difficulty, '~')}  "
+            f"Priority: {'*' * s.task.priority}\\n"
+            f"Due: {fmt_dt(s.task.due)}\\n"
+            f"Remaining: {fmt_hours(s.task.remaining_estimate)}"
+        )
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:lsf-{s.task.id}-{_ics_dt(s.start)}@lsf",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART:{_ics_dt(s.start)}",
+            f"DTEND:{_ics_dt(s.end)}",
+            f"SUMMARY:{s.task.name}",
+            f"DESCRIPTION:{desc}",
+            "END:VEVENT",
+        ]
+    lines.append("END:VCALENDAR")
+
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        f.write("\r\n".join(lines) + "\r\n")
+    return len(slices)
+
+
 def import_csv(existing: list[dict], csv_path: str = CSV_FILE) -> tuple[list[dict], int]:
     """
     Merge tasks from a CSV file into the existing task list.
@@ -177,15 +267,8 @@ def import_csv(existing: list[dict], csv_path: str = CSV_FILE) -> tuple[list[dic
                     if key in existing_keys:
                         continue
 
-                    new_tasks.append({
-                        "id":           str(uuid.uuid4())[:8],
-                        "name":         name,
-                        "due":          due.isoformat(),
-                        "raw_estimate": estimate,
-                        "priority":     priority,
-                        "difficulty":   difficulty,
-                        "time_spent":   0.0,
-                    })
+                    new_tasks.append(new_task_dict(
+                        name, due.isoformat(), estimate, priority, difficulty))
                     existing_keys.add(key)
                     added += 1
 
@@ -477,8 +560,27 @@ def display(tasks: list[Task], slices: list[Slice], now: datetime):
         print(f"  {RED}Run {BOLD}lsf panic{RESET}{RED} for a triage plan.{RESET}")
         print()
 
-    # -- Burndown forecast (individually impossible tasks only) ----------------
+    # -- Deadline risk (EDF feasibility lookahead) ------------------------------
+    # Even when no aggregate overload is visible, per-deadline packing can be
+    # infeasible (an early cluster of deadlines can't all fit). Run the same
+    # EDF check panic mode uses and warn before it turns into missed work.
     overloaded_tasks = [t for t in tasks if t.overloaded]
+    if not overloaded_tasks and not _collectively_overloaded:
+        _, edf_deferred = edf_max_subset(list(tasks), now)
+        if edf_deferred:
+            print()
+            print(f"{BOLD}{'-'*62}{RESET}")
+            print(f"{BOLD}  {YELLOW}DEADLINE RISK{RESET}{BOLD}  "
+                  f"{DIM}not every deadline can be met, even optimally"
+                  f"{RESET}")
+            for t in edf_deferred:
+                print(f"    {YELLOW}~{RESET} {t.name}  "
+                      f"{DIM}due {fmt_dt(t.due)}{RESET}")
+            print(f"{BOLD}{'-'*62}{RESET}")
+            print(f"  {RED}Run {BOLD}lsf panic{RESET}{RED} for a triage plan.{RESET}")
+            print()
+
+    # -- Burndown forecast (individually impossible tasks only) ----------------
     if not overloaded_tasks:
         if not _collectively_overloaded:
             print()
@@ -551,11 +653,13 @@ def update_session(tasks: list[Task]) -> tuple[list[Task], bool]:
             except ValueError:
                 pass
         if done_indices:
-            removed = [tasks[i].name for i in sorted(done_indices)]
+            removed = [tasks[i] for i in sorted(done_indices)]
             tasks   = [t for i, t in enumerate(tasks) if i not in done_indices]
             print()
-            for name in removed:
-                print(f"  {GREEN}[x] Removed: {name}{RESET}")
+            for t in removed:
+                archive_task(task_to_dict(t))
+                print(f"  {GREEN}[x] Done: {t.name}{RESET}  "
+                      f"{DIM}(archived -- 'lsf undo' restores){RESET}")
             changed = True
 
     print()
@@ -813,16 +917,26 @@ def panic(tasks: list[Task], now: datetime):
 # -- Main ---------------------------------------------------------------------
 
 def main():
+    # On Windows, piped output defaults to a legacy codepage that cannot
+    # encode the box-drawing characters -- degrade to '?' instead of crashing.
+    import sys
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, OSError):
+        pass
+
     parser = argparse.ArgumentParser(
         prog="lsf",
         description="Least Slack First assignment scheduler"
     )
     parser.add_argument(
-        "command", nargs="?", default="schedule",
-        choices=["schedule", "panic", "import", "start", "done",
-                 "edit", "pause", "resume", "export"],
+        "command", nargs="?", default="tui",
+        choices=["tui", "schedule", "panic", "import", "start", "done",
+                 "edit", "pause", "resume", "export", "add", "undo",
+                 "history"],
         help=(
-            "schedule (default) -- interactive schedule; "
+            "tui (default) -- full-screen interface; "
+            "schedule -- classic prompt-based schedule; "
             "panic -- survival triage when overloaded; "
             "import -- import tasks from a CSV file; "
             "start -- start a timer for a task (pick by number or id); "
@@ -830,12 +944,33 @@ def main():
             "edit -- edit a task by number or id; "
             "pause -- pause the active timer; "
             "resume -- resume a paused timer; "
-            "export -- write schedule to an .ics calendar file"
+            "export -- write schedule to an .ics calendar file; "
+            "add -- add a task non-interactively (lsf add \"Name\" --est 2h); "
+            "undo -- restore the most recently completed task; "
+            "history -- show completed tasks with estimated vs actual time"
         )
     )
     parser.add_argument(
         "file", nargs="?", default=None,
-        help="CSV file to import (used with the 'import' command)"
+        help="CSV file (import), .ics path (export), task number/id "
+             "(start/edit), or task name (add)"
+    )
+    parser.add_argument(
+        "--due", default=None,
+        help="due date for 'add' (e.g. '25/03 23:59', 'friday 18:00', '+3d'); "
+             "default: tomorrow 23:59"
+    )
+    parser.add_argument(
+        "--est", default=None,
+        help="time estimate for 'add' (e.g. 2h, 90m, 1h30m)"
+    )
+    parser.add_argument(
+        "-p", "--priority", type=int, default=2, metavar="1-4",
+        help="priority for 'add' (1 low ... 4 critical, default 2)"
+    )
+    parser.add_argument(
+        "-d", "--difficulty", type=int, default=2, metavar="1-3",
+        help="difficulty for 'add' (1 light, 2 medium, 3 deep, default 2)"
     )
     parser.add_argument(
         "--next", action="store_true",
@@ -854,6 +989,21 @@ def main():
     if args.version:
         print(f"lsf {__version__}")
         return
+
+    # -- lsf (no args) / lsf tui ----------------------------------------
+    # Full-screen Textual interface. --next/--json bypass it (they have no
+    # positional command, so the default 'tui' would otherwise swallow them).
+    if args.command == "tui" and not (args.next or args.json):
+        try:
+            from .tui import run as _run_tui
+        except ImportError:
+            print(f"  {YELLOW}The full-screen interface needs the 'textual' "
+                  f"package:  pip install textual{RESET}")
+            print(f"  {DIM}Falling back to the classic prompt interface "
+                  f"('lsf schedule').{RESET}")
+        else:
+            _run_tui()
+            return
 
     # -- lsf start [n|id] ---------------------------------------------
     # Pick any task by number or id and start a timer for it.
@@ -1036,6 +1186,85 @@ def main():
         print(f"  {DIM}Run 'lsf done' when finished.{RESET}\n")
         return
 
+    # -- lsf add "Name" --est 2h [--due ...] [-p N] [-d N] --------------
+    if args.command == "add":
+        if not args.file:
+            print(f"  {RED}Usage: lsf add \"Task name\" --est 2h "
+                  f"[--due 'friday 18:00'] [-p 1-4] [-d 1-3]{RESET}")
+            return
+        if not args.est:
+            print(f"  {RED}Missing --est (e.g. --est 2h, --est 90m).{RESET}")
+            return
+        try:
+            estimate = parse_duration(args.est)
+        except ValueError:
+            print(f"  {RED}Could not parse estimate '{args.est}'.{RESET}")
+            return
+        try:
+            due = parse_due_date(args.due or "tomorrow 23:59")
+        except ValueError as e:
+            print(f"  {RED}{e}{RESET}")
+            return
+        if args.priority not in PRIORITY_LABELS:
+            print(f"  {RED}Priority must be 1-4.{RESET}")
+            return
+        if args.difficulty not in DIFFICULTY_LABELS:
+            print(f"  {RED}Difficulty must be 1-3.{RESET}")
+            return
+        raw_a = load_tasks()
+        raw_a.append(new_task_dict(args.file.strip(), due.isoformat(),
+                                   estimate, args.priority, args.difficulty))
+        save_tasks(raw_a)
+        stars = '*' * args.priority
+        print(f"  {GREEN}[x] Added: {args.file.strip()}{RESET}  "
+              f"{DIM}{DIFF_ICON.get(args.difficulty, '~')} {stars}  "
+              f"due {fmt_dt(due)}  est {fmt_hours(estimate)}{RESET}")
+        return
+
+    # -- lsf undo -----------------------------------------------------
+    if args.command == "undo":
+        entry = pop_history()
+        if entry is None:
+            print(f"  {YELLOW}Nothing to undo -- no completed tasks in "
+                  f"the archive.{RESET}")
+            return
+        raw_u = load_tasks()
+        raw_u.append(entry)
+        save_tasks(raw_u)
+        print(f"  {GREEN}[x] Restored: {entry['name']}{RESET}  "
+              f"{DIM}(due {fmt_dt(datetime.fromisoformat(entry['due']))}){RESET}")
+        return
+
+    # -- lsf history --------------------------------------------------
+    if args.command == "history":
+        history = load_history()
+        if not history:
+            print(f"  {DIM}No completed tasks yet.{RESET}")
+            return
+        print()
+        print(f"  {BOLD}Completed tasks{RESET}  "
+              f"{DIM}({len(history)} total, newest first){RESET}")
+        print()
+        for entry in reversed(history[-20:]):
+            done_at = entry.get("completed_at", "")
+            when    = (fmt_dt(datetime.fromisoformat(done_at))
+                       if done_at else "?")
+            est     = entry.get("raw_estimate", 0.0)
+            spent   = entry.get("time_spent", 0.0)
+            if spent > 0:
+                ratio = spent / max(est * RISK_MULTIPLIER, 1e-9)
+                col   = GREEN if ratio <= 1.0 else YELLOW
+                vs    = (f"est {fmt_hours(est)} -> actual "
+                         f"{col}{fmt_hours(spent)}{RESET}")
+            else:
+                vs    = f"est {fmt_hours(est)}  {DIM}(no time logged){RESET}"
+            print(f"  {GREEN}[x]{RESET} {BOLD}{entry['name']}{RESET}  "
+                  f"{DIM}finished {when}{RESET}  ·  {vs}")
+        if len(history) > 20:
+            print(f"  {DIM}... +{len(history) - 20} older{RESET}")
+        print()
+        return
+
     # -- lsf import [file] --------------------------------------------
     if args.command == "import":
         csv_path = args.file or CSV_FILE
@@ -1177,43 +1406,9 @@ def main():
             print("  No sessions to export.")
             return
 
-        out_path = args.file or os.path.join(os.path.expanduser("~"), "lsf_schedule.ics")
-
-        def _ics_dt(dt: datetime) -> str:
-            return dt.strftime("%Y%m%dT%H%M%S")
-
-        lines_x = [
-            "BEGIN:VCALENDAR",
-            "VERSION:2.0",
-            "PRODID:-//lsf//Least Slack First//EN",
-            "CALSCALE:GREGORIAN",
-            "METHOD:PUBLISH",
-        ]
-        stamp_x = _ics_dt(now_x)
-        for sx in slices_x:
-            uid_x   = f"lsf-{sx.task.id}-{_ics_dt(sx.start)}@lsf"
-            desc_x  = (
-                f"Difficulty: {DIFF_ICON.get(sx.task.difficulty, '~')}  "
-                f"Priority: {'*' * sx.task.priority}\\n"
-                f"Due: {fmt_dt(sx.task.due)}\\n"
-                f"Remaining: {fmt_hours(sx.task.remaining_estimate)}"
-            )
-            lines_x += [
-                "BEGIN:VEVENT",
-                f"UID:{uid_x}",
-                f"DTSTAMP:{stamp_x}",
-                f"DTSTART:{_ics_dt(sx.start)}",
-                f"DTEND:{_ics_dt(sx.end)}",
-                f"SUMMARY:{sx.task.name}",
-                f"DESCRIPTION:{desc_x}",
-                "END:VEVENT",
-            ]
-        lines_x.append("END:VCALENDAR")
-
-        with open(out_path, "w", encoding="utf-8", newline="") as f:
-            f.write("\r\n".join(lines_x) + "\r\n")
-
-        print(f"  {GREEN}[x] Exported {len(slices_x)} session(s) to {out_path}{RESET}")
+        out_path = args.file or DEFAULT_ICS_PATH
+        n_x = export_ics(slices_x, out_path, now_x)
+        print(f"  {GREEN}[x] Exported {n_x} session(s) to {out_path}{RESET}")
         return
 
     now = datetime.now()
@@ -1318,7 +1513,9 @@ def main():
         _avail_total = daylight_hours_until(_latest_due, now)
         _any_impossible      = any(t.overloaded for t in _check_ordered)
         _collectively_over   = _total_rem > _avail_total and not _any_impossible
-        _overload_detected   = _any_impossible or _collectively_over
+        _, _edf_deferred     = edf_max_subset(list(_check_ordered), now)
+        _overload_detected   = (_any_impossible or _collectively_over
+                                or bool(_edf_deferred))
         if not _overload_detected:
             print()
             print(f"  {GREEN}[x] No overload detected -- lsf panic is not needed.{RESET}")

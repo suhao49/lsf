@@ -21,6 +21,7 @@ SLICE_H               = CFG['slice_h']
 SWITCH_URGENCY_PENALTY = CFG['switch_urgency_penalty']
 URGENCY_SLACK_FLOOR   = CFG['urgency_slack_floor_h']
 URGENCY_BAND_PCT      = CFG['urgency_band_pct']
+MIN_SLICE_H           = CFG['min_slice_h']
 EPSILON               = 0.01
 
 
@@ -39,6 +40,46 @@ def _day_total_h(d: date) -> float:
     return CFG["total_h_by_day"][d.weekday()]
 
 
+# Working-hours arithmetic in O(1):
+# window hours depend only on the weekday, so cumulative working time from a
+# fixed epoch is (whole weeks) x (weekly total) + a partial-week walk of <= 6
+# days. daylight_hours_until / add_working_hours then reduce to arithmetic
+# instead of walking day-by-day, which matters because the slice scheduler
+# calls them for every task on every slice.
+
+_EPOCH        = date(2001, 1, 1)   # a Monday, safely before any real task
+_WEEK_TOTAL_H = sum(CFG["total_h_by_day"][i] for i in range(7))
+
+
+def _working_h_from_epoch(d: date) -> float:
+    """Total working hours in all days from _EPOCH up to (excluding) d."""
+    days = (d - _EPOCH).days
+    if days <= 0:
+        return 0.0
+    weeks, rem = divmod(days, 7)
+    total = weeks * _WEEK_TOTAL_H
+    for weekday in range(rem):   # _EPOCH is a Monday, so index == weekday
+        total += CFG["total_h_by_day"][weekday]
+    return total
+
+
+def _working_h_before(dt: datetime) -> float:
+    """Working hours within dt's own day that fall before time dt."""
+    total = 0.0
+    for ws_t, we_t in _windows_for_day(dt.date()):
+        ws = datetime.combine(dt.date(), ws_t)
+        we = datetime.combine(dt.date(), we_t)
+        end = min(dt, we)
+        if end > ws:
+            total += (end - ws).total_seconds() / 3600
+    return total
+
+
+def _working_position(dt: datetime) -> float:
+    """Absolute position of dt on the working-hours axis (from _EPOCH)."""
+    return _working_h_from_epoch(dt.date()) + _working_h_before(dt)
+
+
 def daylight_hours_until(due: datetime, now: datetime) -> float:
     """
     Count available working hours between now and due across all configured
@@ -46,24 +87,7 @@ def daylight_hours_until(due: datetime, now: datetime) -> float:
     """
     if due <= now:
         return 0.0
-    total  = 0.0
-    cursor = now
-
-    while cursor.date() <= due.date():
-        for ws_t, we_t in _windows_for_day(cursor.date()):
-            ws = datetime.combine(cursor.date(), ws_t)
-            we = datetime.combine(cursor.date(), we_t)
-            window_start = max(cursor, ws)
-            window_end   = min(due, we)
-            if window_end > window_start:
-                total += (window_end - window_start).total_seconds() / 3600
-        next_date = cursor.date() + timedelta(days=1)
-        wins_next = _windows_for_day(next_date)
-        cursor    = datetime.combine(next_date, wins_next[0][0])
-        if cursor >= due:
-            break
-
-    return total
+    return max(_working_position(due) - _working_position(now), 0.0)
 
 
 def add_working_hours(start: datetime, hours: float) -> datetime:
@@ -71,36 +95,37 @@ def add_working_hours(start: datetime, hours: float) -> datetime:
     Advance start by hours of working time, skipping gaps between windows
     and between days.
     """
-    remaining = hours
-    cursor    = start
+    if hours <= 0:
+        return start
 
-    while remaining > 0:
-        advanced = False
-        for ws_t, we_t in _windows_for_day(cursor.date()):
-            ws = datetime.combine(cursor.date(), ws_t)
-            we = datetime.combine(cursor.date(), we_t)
-            window_start = max(cursor, ws)
-            window_end   = we
-            if window_end <= window_start:
-                continue
-            available = (window_end - window_start).total_seconds() / 3600
-            if remaining <= available:
-                cursor    = window_start + timedelta(hours=remaining)
-                remaining = 0
-                advanced  = True
-                break
-            else:
-                remaining -= available
-                cursor    = window_end
-                advanced  = True
-                break   # restart outer loop so next window is found correctly
+    target = _working_position(start) + hours
 
-        if remaining > 0 and not advanced:
-            next_date = cursor.date() + timedelta(days=1)
-            wins_next = _windows_for_day(next_date)
-            cursor    = datetime.combine(next_date, wins_next[0][0])
+    d = start.date()
+    if _WEEK_TOTAL_H > 0:
+        # Jump whole weeks in one step, then walk the remainder day-by-day
+        deficit = target - _working_h_from_epoch(d)
+        weeks   = int(deficit // _WEEK_TOTAL_H)
+        if weeks > 1:
+            d += timedelta(weeks=weeks - 1)
 
-    return cursor
+    for _ in range(4000):   # safety bound (~11 years of zero-hour days)
+        if _working_h_from_epoch(d + timedelta(days=1)) >= target - 1e-9:
+            # target lands within day d -- walk its windows
+            need = target - _working_h_from_epoch(d)
+            for ws_t, we_t in _windows_for_day(d):
+                ws  = datetime.combine(d, ws_t)
+                we  = datetime.combine(d, we_t)
+                w_h = (we - ws).total_seconds() / 3600
+                if w_h <= 0:
+                    continue
+                if need <= w_h + 1e-9:
+                    return ws + timedelta(hours=max(need, 0.0))
+                need -= w_h
+            # float rounding tail: snap to the last window end
+            return datetime.combine(d, _windows_for_day(d)[-1][1])
+        d += timedelta(days=1)
+
+    return datetime.combine(d, _windows_for_day(d)[0][0])   # unreachable fallback
 
 
 # -- Task model ---------------------------------------------------------------
@@ -259,6 +284,12 @@ def schedule_sliced(tasks: list[Task], now: datetime,
         medium (2) -- 60 min
         deep   (3) -- 90 min
 
+    Slices are window-aware: within the urgency band, tasks whose natural
+    slice fits the remaining time in the current window are preferred, so
+    short windows (recess breaks) get light/short work instead of splitting
+    a deep slice across a gap. If nothing fits, the winning task's slice is
+    clipped to the window; slivers shorter than min_slice_min are skipped.
+
     break_h parameter: override break length (pass 0.0 to disable, e.g. for panic mode).
     Defaults to the configured break_h from config.toml.
 
@@ -279,8 +310,10 @@ def schedule_sliced(tasks: list[Task], now: datetime,
     slices:   list[Slice] = []
     cursor    = _snap_to_next_window(now)
     prev_id:  str | None  = None
+    # Window clipping can produce more slices than remaining/slice_h alone
+    # (each short window adds one), so cap on the finest granularity.
     max_iter  = sum(
-        max(1, int(remaining[t.id] / SLICE_H[t.difficulty]) + 1)
+        max(1, int(remaining[t.id] / max(MIN_SLICE_H, 1e-3)) + 1)
         for t in tasks
     ) + len(tasks) + 10   # safety cap
 
@@ -289,6 +322,16 @@ def schedule_sliced(tasks: list[Task], now: datetime,
         active = [t for t in tasks if remaining[t.id] > 1e-6]
         if not active:
             break
+
+        # Skip window slivers too short for useful work (unless some task
+        # could actually finish inside the sliver)
+        cursor   = _snap_to_next_window(cursor)
+        win_left = _remaining_in_window(cursor)
+        min_useful = min(MIN_SLICE_H, min(remaining[t.id] for t in active))
+        if win_left < min_useful - 1e-9:
+            cursor = _snap_to_next_window(
+                add_working_hours(cursor, max(win_left, 1e-4)))
+            win_left = _remaining_in_window(cursor)
 
         # Recompute urgency for each active task as of cursor,
         # passing the current task id so the switch penalty applies
@@ -307,10 +350,20 @@ def schedule_sliced(tasks: list[Task], now: datetime,
         max_urg    = max(t.raw_urgency for t in active)
         band_floor = max_urg * (1.0 - URGENCY_BAND_PCT)
         band       = [t for t in active if t.raw_urgency >= band_floor]
-        chosen     = min(band, key=lambda t: remaining[t.id])
 
-        # Slice size: min(difficulty slice, what's left)
+        # Window-aware pick: prefer band tasks whose natural slice fits what
+        # is left of the current window, so short windows get short work.
+        fitting = [t for t in band
+                   if min(SLICE_H[t.difficulty], remaining[t.id])
+                   <= win_left + 1e-9]
+        pool    = fitting if fitting else band
+        chosen  = min(pool, key=lambda t: remaining[t.id])
+
+        # Slice size: natural slice, clipped to the window so sessions never
+        # straddle a gap between windows.
         slice_h = min(SLICE_H[chosen.difficulty], remaining[chosen.id])
+        if not fitting:
+            slice_h = min(slice_h, win_left)
 
         start  = cursor
         end    = add_working_hours(cursor, slice_h)
