@@ -30,6 +30,45 @@ pip install .
 
 `lsf` will be available as a command after the install. If pip warns about the scripts directory not being on `PATH`, add it — typically `%APPDATA%\Python\PythonXY\Scripts`.
 
+### Standalone bundles (no Python required)
+
+Self-contained builds can be made with [PyInstaller](https://pyinstaller.org) — it bundles
+Python and all dependencies into a folder the end user just unzips and runs:
+
+```powershell
+# Windows
+pip install textual pyinstaller
+.\packaging\build-windows.ps1     # -> dist\lsf-<version>-windows-x64.zip
+```
+
+```sh
+# Linux / macOS
+pip install textual pyinstaller
+bash packaging/build-posix.sh     # -> dist/lsf-<version>-<os>-<arch>.tar.gz
+```
+
+The recipient unpacks the archive anywhere and runs `lsf/lsf.exe` (Windows) or `lsf/lsf`
+from a terminal. On Windows, double-clicking also works — it opens the TUI in a new console
+window. To use `lsf` as a command, add the unpacked folder to `PATH`.
+
+CI builds all of these automatically: `.github/workflows/build.yml` produces the Windows
+zip, macOS tarballs (Apple Silicon and Intel), a Linux tarball, a `.deb`, and an `.rpm`
+on every push, and attaches them to a draft GitHub release when a `v*` tag is pushed.
+
+Notes:
+
+- PyInstaller does not cross-compile — each bundle must be built on its target OS/arch
+  (which is what the CI matrix does).
+- The Linux tarball runs on distros with glibc at least as new as the build machine's
+  (CI builds on Ubuntu 22.04 for wide compatibility).
+- The binaries are unsigned: Windows SmartScreen may show "Windows protected your PC"
+  (*More info → Run anyway*), and macOS Gatekeeper may quarantine the download
+  (right-click → *Open*, or `xattr -dr com.apple.quarantine lsf/`). Signing requires a
+  code-signing certificate / Apple Developer ID.
+- Data still lives in the usual per-user locations (`%LOCALAPPDATA%\lsf`,
+  `%APPDATA%\lsf\config.toml`, or `~/.config/lsf` + `~/.lsf` on Linux), so
+  upgrading the bundle never touches tasks or config.
+
 ### Arch Linux
 
 ```sh

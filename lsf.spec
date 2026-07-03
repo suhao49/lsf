@@ -30,15 +30,20 @@ Deadline First to triage overloaded schedules.
 %prep
 # Run from the repo root: rpmbuild -ba lsf.spec --define "_sourcedir %(pwd)"
 # or use: fedpkg local / mock
-cp -r %{_sourcedir}/. %{_builddir}/%{name}-%{version}
+# %%setup -c -T creates and registers the build subdirectory (no tarball),
+# so %%build/%%install/%%doc all resolve there on both old and new rpm.
+%setup -q -c -T
+cp -r %{_sourcedir}/. .
+rm -rf dist build
 
 %build
-cd %{_builddir}/%{name}-%{version}
-python3 -m build --wheel --no-isolation
+# Full interpreter path: installer copies sys.executable into the lsf script's
+# shebang, and a /usr/sbin/python3 shebang (sbin-merge symlink) becomes an
+# unsatisfiable rpm file dependency.
+/usr/bin/python3 -m build --wheel --no-isolation
 
 %install
-cd %{_builddir}/%{name}-%{version}
-python3 -m installer --destdir=%{buildroot} dist/*.whl
+/usr/bin/python3 -m installer --destdir=%{buildroot} dist/*.whl
 
 install -Dm644 config/config.toml.example \
     %{buildroot}%{_datadir}/%{name}/config.toml.example
