@@ -1,4 +1,3 @@
-# Maintainer: Nguyen <s02179@bvisvietnam.com>
 pkgname=lsf-git
 pkgver=1.0.0
 pkgrel=1
