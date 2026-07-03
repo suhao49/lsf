@@ -1,4 +1,4 @@
-# Maintainer: Nguyen <s02179@bvisvietnam.com>
+# Maintainer: Nguyen <nguyenphamduyanh2@protonmail.com>
 pkgname=lsf-git
 pkgver=1.0.0
 pkgrel=1
