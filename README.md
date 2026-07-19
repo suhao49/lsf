@@ -150,8 +150,8 @@ Running `lsf` with no arguments opens the full-screen terminal interface:
 ```
 
 Keys: `a` add task · `e` edit · `d` mark done · `u` undo · `s` start/stop timer ·
-`l` log time manually · `p` pause/resume · `x` export .ics · `shift+p` panic triage ·
-`r` reload · `q` quit.
+`l` log time manually · `t` tick subtasks · `b` busy periods · `p` pause/resume ·
+`x` export .ics · `shift+p` panic triage · `r` reload · `q` quit.
 
 `l` logs time on the selected task without running a timer — useful for work
 you did away from the computer or forgot to time. Enter `1h30m` to add,
@@ -162,6 +162,42 @@ While a timer is running the TUI rings the terminal bell and shows a
 notification when you have worked a full slice ("time for a break") and when
 a pause has lasted longer than `break_min` ("break over").
 
+### Subtasks
+
+A task can be split into weighted parts — in the add/edit form, fill the
+**Subtasks** field:
+
+- `Chapter 1..11` expands to eleven subtasks (Chapter 1 … Chapter 11).
+- `intro, body*3, conclusion*2` — the number after `*` is the part's weight
+  (share of the total estimate); omitted weights are 1. Here `body` is 3/6 of
+  the estimate.
+- **Subtask order** `y` means parts must be done in sequence (a textbook:
+  chapter 1 before chapter 2); `n` means any order.
+
+Press `t` on the task to tick parts off. Each finished part removes its
+weight share from the remaining estimate, and the running time counter resets
+so a slow chapter never eats into the estimates of the chapters still to do.
+The task table shows progress as `3/11`; the detail panel shows which part is
+next. The whole task is still completed with `d` once you're done.
+
+### One-off busy periods
+
+Press `b` (or use `lsf busy` from the CLI) to block out time the scheduler
+must not use — "Thursday 2–4pm is a meeting, no work". Type e.g.
+`thursday 14:00-16:00 team meeting`, `tomorrow 2-4pm dentist`, or
+`25/03 9am-12pm open day`; typing a number deletes that block. The blocked
+time is subtracted from that day's working windows, so slack, urgency, and
+the day plan all adjust automatically. Past blocks clean themselves up.
+
+### Recurring tasks
+
+Set **Repeat** to `daily` or `weekly` in the add/edit form (or
+`lsf add "Anki" --est 30m --due tonight --recur daily`). Completing a
+recurring task archives that period and resets it for the next one instead
+of deleting it. If a period passes without you hitting done — maybe you
+simply forgot — the task quietly moves to the current period with progress
+reset: no reminders, no overdue nagging, no pile-up.
+
 The timer, schedule, and task data are shared with the CLI commands below, so
 you can mix and match freely (e.g. start a timer in the TUI, stop it with
 `lsf done` later).
@@ -170,6 +206,11 @@ you can mix and match freely (e.g. start a timer in the TUI, stop it with
 lsf                      # full-screen TUI (default)
 lsf schedule             # classic prompt-based schedule
 lsf add "Essay" --est 2h --due "friday 18:00" -p 3 -d 3   # non-interactive add
+lsf add "Read textbook" --est 8h --subtasks "Chapter 1..8" --ordered
+lsf add "Anki" --est 30m --due tonight --recur daily      # repeats every day
+lsf busy "thursday 14:00-16:00 meeting"   # block out a one-off no-work period
+lsf busy                 # list busy periods
+lsf busy 2               # delete busy period 2
 lsf undo                 # restore the most recently completed task
 lsf history              # completed tasks with estimated vs actual time
 lsf start                # start a timer for a task

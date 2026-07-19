@@ -25,19 +25,99 @@ MIN_SLICE_H           = CFG['min_slice_h']
 EPSILON               = 0.01
 
 
+# -- One-off busy blocks ------------------------------------------------------
+# Busy blocks are one-time no-work periods ("Thursday 2-4pm meeting") that get
+# subtracted from that date's working windows. The weekday-based O(1) prefix
+# math below stays intact: per-date corrections are kept in small dicts and
+# applied on top (blocks are few, so the extra term is effectively free).
+
+_BUSY_SRC:       list[tuple[datetime, datetime, str]] = []
+_EFF_WINDOWS:    dict[date, list[tuple[dtime, dtime]]] = {}
+_BUSY_H_BY_DATE: dict[date, float] = {}
+
+
+def _subtract_intervals(windows: list[tuple[dtime, dtime]],
+                        busy: list[tuple[dtime, dtime]]) -> list[tuple[dtime, dtime]]:
+    segs = list(windows)
+    for bs, be in busy:
+        nxt = []
+        for s0, e0 in segs:
+            if be <= s0 or bs >= e0:
+                nxt.append((s0, e0))
+                continue
+            if bs > s0:
+                nxt.append((s0, bs))
+            if be < e0:
+                nxt.append((be, e0))
+        segs = nxt
+    return [(s, e) for s, e in segs if e > s]
+
+
+def set_busy_blocks(blocks: list[dict]) -> None:
+    """Install one-off busy blocks ({"start": iso, "end": iso, "name": str})
+    into the working-hours math. Replaces any previously installed set."""
+    global _BUSY_SRC
+    _BUSY_SRC = []
+    _EFF_WINDOWS.clear()
+    _BUSY_H_BY_DATE.clear()
+
+    by_date: dict[date, list[tuple[dtime, dtime]]] = {}
+    for b in blocks:
+        try:
+            s = datetime.fromisoformat(b["start"])
+            e = datetime.fromisoformat(b["end"])
+        except (KeyError, ValueError):
+            continue
+        if e <= s:
+            continue
+        _BUSY_SRC.append((s, e, b.get("name", "busy")))
+        # Split multi-day blocks at midnight
+        d = s.date()
+        while d <= e.date():
+            seg_s = s.time() if d == s.date() else dtime(0, 0)
+            seg_e = e.time() if d == e.date() else dtime(23, 59, 59)
+            by_date.setdefault(d, []).append((seg_s, seg_e))
+            d += timedelta(days=1)
+
+    def _h(wins):
+        return sum(
+            (datetime.combine(_EPOCH, e) - datetime.combine(_EPOCH, s)
+             ).total_seconds() / 3600
+            for s, e in wins
+        )
+
+    for d, busy in by_date.items():
+        base = CFG["windows_by_day"][d.weekday()]
+        eff  = _subtract_intervals(base, busy)
+        _EFF_WINDOWS[d]    = eff
+        _BUSY_H_BY_DATE[d] = _h(base) - _h(eff)
+
+
+def busy_blocks_for_day(d: date) -> list[tuple[datetime, datetime, str]]:
+    """Installed busy blocks overlapping date d (for display)."""
+    day_s = datetime.combine(d, dtime(0, 0))
+    day_e = day_s + timedelta(days=1)
+    return [(s, e, name) for s, e, name in _BUSY_SRC
+            if s < day_e and e > day_s]
+
+
 # -- Time utilities -----------------------------------------------------------
 
 def _windows_for_day(d: date) -> list[tuple[dtime, dtime]]:
     """Return the list of (start, end) time windows for a given date.
     Individual day sections ([monday]..[sunday]) take precedence over
-    [weekday] / [weekend] defaults.
+    [weekday] / [weekend] defaults. One-off busy blocks are subtracted,
+    so the result may be empty for a fully blocked day.
     """
+    eff = _EFF_WINDOWS.get(d)
+    if eff is not None:
+        return eff
     return CFG["windows_by_day"][d.weekday()]
 
 
 def _day_total_h(d: date) -> float:
     """Total available working hours on a given date."""
-    return CFG["total_h_by_day"][d.weekday()]
+    return CFG["total_h_by_day"][d.weekday()] - _BUSY_H_BY_DATE.get(d, 0.0)
 
 
 # Working-hours arithmetic in O(1):
@@ -60,6 +140,10 @@ def _working_h_from_epoch(d: date) -> float:
     total = weeks * _WEEK_TOTAL_H
     for weekday in range(rem):   # _EPOCH is a Monday, so index == weekday
         total += CFG["total_h_by_day"][weekday]
+    # Busy-block correction: subtract hours removed on dates before d
+    for bd, h in _BUSY_H_BY_DATE.items():
+        if bd < d:
+            total -= h
     return total
 
 
@@ -111,8 +195,12 @@ def add_working_hours(start: datetime, hours: float) -> datetime:
     for _ in range(4000):   # safety bound (~11 years of zero-hour days)
         if _working_h_from_epoch(d + timedelta(days=1)) >= target - 1e-9:
             # target lands within day d -- walk its windows
+            wins = _windows_for_day(d)
+            if not wins:   # fully blocked day (busy blocks) -- keep walking
+                d += timedelta(days=1)
+                continue
             need = target - _working_h_from_epoch(d)
-            for ws_t, we_t in _windows_for_day(d):
+            for ws_t, we_t in wins:
                 ws  = datetime.combine(d, ws_t)
                 we  = datetime.combine(d, we_t)
                 w_h = (we - ws).total_seconds() / 3600
@@ -122,7 +210,7 @@ def add_working_hours(start: datetime, hours: float) -> datetime:
                     return ws + timedelta(hours=max(need, 0.0))
                 need -= w_h
             # float rounding tail: snap to the last window end
-            return datetime.combine(d, _windows_for_day(d)[-1][1])
+            return datetime.combine(d, wins[-1][1])
         d += timedelta(days=1)
 
     return datetime.combine(d, _windows_for_day(d)[0][0])   # unreachable fallback
@@ -132,7 +220,9 @@ def add_working_hours(start: datetime, hours: float) -> datetime:
 
 class Task:
     def __init__(self, name: str, due: datetime, estimate_h: float,
-                 priority: int, task_id: str = None, difficulty: int = 2):
+                 priority: int, task_id: str = None, difficulty: int = 2,
+                 subtasks: list[dict] | None = None, ordered: bool = False,
+                 recur: str | None = None):
         self.id           = task_id or str(uuid.uuid4())[:8]
         self.name         = name
         self.due          = due
@@ -140,6 +230,35 @@ class Task:
         self.priority     = priority
         self.difficulty   = difficulty   # 1=light  2=medium  3=deep
         self.time_spent   = 0.0
+        self.subtasks     = subtasks or []   # [{"name", "weight", "done"}]
+        self.ordered      = ordered          # subtasks must be done in order
+        self.recur        = recur            # None | "daily" | "weekly"
+
+    # -- Subtask helpers ---------------------------------------------------------
+
+    def subtask_counts(self) -> tuple[int, int]:
+        """(done, total) subtask counts; (0, 0) when the task has no subtasks."""
+        if not self.subtasks:
+            return 0, 0
+        return sum(1 for s in self.subtasks if s.get("done")), len(self.subtasks)
+
+    def undone_fraction(self) -> float:
+        """Weight fraction of subtasks not yet done (1.0 without subtasks)."""
+        if not self.subtasks:
+            return 1.0
+        total = sum(max(float(s.get("weight", 1.0)), 0.0) for s in self.subtasks)
+        if total <= 0:
+            return 1.0
+        undone = sum(max(float(s.get("weight", 1.0)), 0.0)
+                     for s in self.subtasks if not s.get("done"))
+        return undone / total
+
+    def next_subtask(self) -> str | None:
+        """Name of the first not-done subtask, or None."""
+        for s in self.subtasks:
+            if not s.get("done"):
+                return s["name"]
+        return None
 
         # Computed by compute()
         self.adjusted_estimate:  float    = 0.0
@@ -158,18 +277,26 @@ class Task:
         current_task_id: if set and differs from self.id, applies the switch
         urgency penalty so the scheduler favours continuing the current task.
         """
-        self.adjusted_estimate  = max(self.raw_estimate, 0.1) * RISK_MULTIPLIER
+        # Subtasks scale the estimate: only the not-yet-done weight fraction
+        # still costs time. time_spent counts against that remaining portion
+        # (it is reset when a subtask is completed, so overruns on a finished
+        # part never eat into the estimates of the parts still to do).
+        frac = self.undone_fraction()
+        self.adjusted_estimate  = max(self.raw_estimate, 0.1) * RISK_MULTIPLIER * frac
         self.remaining_estimate = max(self.adjusted_estimate - self.time_spent, 0.0)
 
         # Deadline before first window of that day: snap to end of previous day's last window
-        effective_due   = self.due
-        due_wins        = _windows_for_day(self.due.date())
-        first_win_start = datetime.combine(self.due.date(), due_wins[0][0])
-        if self.due <= first_win_start:
-            prev_wins     = _windows_for_day((self.due - timedelta(days=1)).date())
-            effective_due = datetime.combine(
-                (self.due - timedelta(days=1)).date(), prev_wins[-1][1]
-            )
+        effective_due = self.due
+        due_wins      = _windows_for_day(self.due.date())
+        if not due_wins or self.due <= datetime.combine(self.due.date(), due_wins[0][0]):
+            # Walk back to the previous day that has any working window
+            # (busy blocks can empty a day entirely)
+            for back in range(1, 8):
+                prev_d    = (self.due - timedelta(days=back)).date()
+                prev_wins = _windows_for_day(prev_d)
+                if prev_wins:
+                    effective_due = datetime.combine(prev_d, prev_wins[-1][1])
+                    break
 
         self.available_h = daylight_hours_until(effective_due, now)
         self.slack       = self.available_h - self.remaining_estimate
@@ -437,6 +564,9 @@ def today_slices(slices: list[Slice], now: datetime) -> tuple[list[Slice], datet
 
     for _ in range(8):   # look ahead up to a week
         wins = _windows_for_day(check_date)
+        if not wins:     # fully blocked day (busy blocks)
+            check_date += timedelta(days=1)
+            continue
         # Last window end for this day
         last_end = datetime.combine(check_date, wins[-1][1])
         if last_end > now or check_date > now.date():

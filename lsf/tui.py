@@ -30,15 +30,21 @@ from textual.widgets import Button, DataTable, Footer, Input, Label, Static
 from .task import (
     Task, schedule_sliced, today_slices, edf_max_subset,
     _windows_for_day, _day_total_h, daylight_hours_until,
+    busy_blocks_for_day,
     BREAK_H, SLICE_H,
 )
 from .scheduler import (
     load_tasks, save_tasks, load_session, save_session, clear_session,
     import_csv, dict_to_task, export_ics, new_task_dict,
     archive_task, pop_history, mark_session_end, resume_after_break,
+    load_busy, save_busy, roll_recurring, complete_task_dict,
+    restore_history_entry,
     PRIORITY_LABELS, DIFFICULTY_LABELS, DIFF_ICON, DEFAULT_ICS_PATH,
 )
-from .util import fmt_hours, fmt_dt, parse_due_date, parse_duration
+from .util import (
+    fmt_hours, fmt_dt, parse_due_date, parse_duration,
+    parse_subtasks, fmt_subtasks, parse_busy_block,
+)
 
 
 # -- Markup helpers -----------------------------------------------------------
@@ -107,6 +113,15 @@ class TaskForm(ModalScreen):
             yield Input(value=str(t["priority"]) if t else "2", id="f-pri")
             yield Label("Difficulty  [dim]1 light · 2 medium · 3 deep[/]")
             yield Input(value=str(t.get("difficulty", 2)) if t else "2", id="f-diff")
+            yield Label("Subtasks  [dim]optional · 'Ch 1..11' or 'intro, body*3' (weight after *)[/]")
+            yield Input(value=fmt_subtasks(t.get("subtasks") or []) if t else "",
+                        placeholder="leave blank for none", id="f-subs")
+            yield Label("Subtask order  [dim]y = must do in order · n = any order[/]")
+            yield Input(value=("y" if t.get("ordered") else "n") if t else "n",
+                        id="f-ord")
+            yield Label("Repeat  [dim]blank = one-off · daily · weekly[/]")
+            yield Input(value=(t.get("recur") or "") if t else "",
+                        placeholder="", id="f-rep")
             yield Label("", id="form-error")
             with Horizontal(id="form-buttons"):
                 yield Button("Save", variant="success", id="f-save")
@@ -165,12 +180,37 @@ class TaskForm(ModalScreen):
             err.update("[red]Difficulty must be 1-3.[/]")
             return
 
+        try:
+            subtasks = parse_subtasks(self.query_one("#f-subs", Input).value)
+        except ValueError as e:
+            err.update(f"[red]{escape(str(e))}[/]")
+            return
+        # Editing: keep done flags for subtasks whose name survived the edit
+        if subtasks and self._task_dict:
+            old_done = {s["name"]: bool(s.get("done"))
+                        for s in self._task_dict.get("subtasks") or []}
+            for s in subtasks:
+                s["done"] = old_done.get(s["name"], False)
+
+        ordered = self.query_one("#f-ord", Input).value.strip().lower() in (
+            "y", "yes", "true", "1")
+
+        rep = self.query_one("#f-rep", Input).value.strip().lower()
+        recur = {"": None, "d": "daily", "daily": "daily",
+                 "w": "weekly", "weekly": "weekly"}.get(rep, "?")
+        if recur == "?":
+            err.update("[red]Repeat must be blank, daily, or weekly.[/]")
+            return
+
         self.dismiss({
             "name":         name,
             "due":          due.isoformat(),
             "raw_estimate": estimate,
             "priority":     priority,
             "difficulty":   difficulty,
+            "subtasks":     subtasks,
+            "ordered":      ordered,
+            "recur":        recur,
         })
 
 
@@ -229,6 +269,165 @@ class LogTimeForm(ModalScreen):
             err.update("[red]Total logged time cannot go below 0.[/]")
             return
         self.dismiss(total)
+
+
+class SubtaskScreen(ModalScreen):
+    """Tick/untick a task's subtasks. Dismisses with
+    (updated_subtasks, any_newly_completed) or None if nothing changed."""
+
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    def __init__(self, task_name: str, subtasks: list[dict], ordered: bool):
+        super().__init__()
+        self._task_name  = task_name
+        self._subs       = [dict(s) for s in subtasks]
+        self._ordered    = ordered
+        self._changed    = False
+        self._newly_done = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="subs-box"):
+            yield Label(f"[bold]Parts -- {escape(self._task_name)}[/]",
+                        id="subs-title")
+            with VerticalScroll(id="subs-scroll"):
+                yield Static(self._list_markup(), id="subs-list")
+            hint = ("must be done in order" if self._ordered else "any order")
+            yield Label(f"[dim]Number = tick/untick ({hint}) · "
+                        f"Enter on empty or Esc closes[/]")
+            yield Input(placeholder="part number", id="subs-input")
+            yield Label("", id="subs-error")
+
+    def on_mount(self) -> None:
+        self.query_one("#subs-input", Input).focus()
+
+    def _list_markup(self) -> str:
+        total_w = sum(max(float(s.get("weight", 1.0)), 0.0)
+                      for s in self._subs) or 1.0
+        lines, next_marked = [], False
+        for i, s in enumerate(self._subs, 1):
+            done = bool(s.get("done"))
+            box  = "[green]\\[x][/]" if done else "\\[ ]"
+            pct  = max(float(s.get("weight", 1.0)), 0.0) / total_w * 100
+            mark = ""
+            if not done and not next_marked:
+                mark = "  [cyan]<- next[/]"
+                next_marked = True
+            lines.append(f" {i:>2}. {box} {escape(s['name'])}"
+                         f"  [dim]{pct:.0f}%[/]{mark}")
+        return "\n".join(lines) or "[dim]No subtasks.[/]"
+
+    def _result(self):
+        return (self._subs, self._newly_done) if self._changed else None
+
+    def action_close(self) -> None:
+        self.dismiss(self._result())
+
+    @on(Input.Submitted)
+    def _submitted(self) -> None:
+        err = self.query_one("#subs-error", Label)
+        inp = self.query_one("#subs-input", Input)
+        raw = inp.value.strip()
+        if not raw:
+            self.dismiss(self._result())
+            return
+        try:
+            idx = int(raw)
+            if not (1 <= idx <= len(self._subs)):
+                raise ValueError
+        except ValueError:
+            err.update(f"[red]Enter a number 1-{len(self._subs)}.[/]")
+            return
+        s = self._subs[idx - 1]
+        if self._ordered:
+            if not s.get("done") and any(not p.get("done")
+                                         for p in self._subs[:idx - 1]):
+                err.update("[red]This task is ordered -- finish the "
+                           "earlier parts first.[/]")
+                return
+            if s.get("done") and any(p.get("done")
+                                     for p in self._subs[idx:]):
+                err.update("[red]Untick the later parts first.[/]")
+                return
+        s["done"] = not s.get("done")
+        if s["done"]:
+            self._newly_done = True
+        self._changed = True
+        err.update("")
+        inp.value = ""
+        self.query_one("#subs-list", Static).update(self._list_markup())
+
+
+class BusyScreen(ModalScreen):
+    """View/add/delete one-off busy blocks. Dismisses with the updated
+    block list, or None if nothing changed."""
+
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    def __init__(self, blocks: list[dict]):
+        super().__init__()
+        self._blocks  = [dict(b) for b in blocks]
+        self._changed = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="busy-box"):
+            yield Label("[bold]Busy periods[/]  [dim](no work is scheduled "
+                        "over these)[/]", id="busy-title")
+            yield Static(self._list_markup(), id="busy-list")
+            yield Label("[dim]Type e.g. 'thursday 2-4pm meeting' to add · "
+                        "a number deletes · Esc closes[/]")
+            yield Input(placeholder="thursday 14:00-16:00 meeting",
+                        id="busy-input")
+            yield Label("", id="busy-error")
+
+    def on_mount(self) -> None:
+        self.query_one("#busy-input", Input).focus()
+
+    def _list_markup(self) -> str:
+        if not self._blocks:
+            return "[dim]No busy periods.[/]"
+        lines = []
+        for i, b in enumerate(self._blocks, 1):
+            try:
+                s = datetime.fromisoformat(b["start"])
+                e = datetime.fromisoformat(b["end"])
+            except (KeyError, ValueError):
+                continue
+            lines.append(f" {i:>2}. {fmt_dt(s)} - {e:%H:%M}  "
+                         f"[bold]{escape(b.get('name', 'busy'))}[/]")
+        return "\n".join(lines)
+
+    def _result(self):
+        return self._blocks if self._changed else None
+
+    def action_close(self) -> None:
+        self.dismiss(self._result())
+
+    @on(Input.Submitted)
+    def _submitted(self) -> None:
+        err = self.query_one("#busy-error", Label)
+        inp = self.query_one("#busy-input", Input)
+        raw = inp.value.strip()
+        if not raw:
+            self.dismiss(self._result())
+            return
+        if raw.isdigit():
+            n = int(raw)
+            if not (1 <= n <= len(self._blocks)):
+                err.update(f"[red]No busy block #{n}.[/]")
+                return
+            self._blocks.pop(n - 1)
+        else:
+            try:
+                block = parse_busy_block(raw)
+            except ValueError as e:
+                err.update(f"[red]{escape(str(e))}[/]")
+                return
+            self._blocks.append(block)
+            self._blocks.sort(key=lambda b: b.get("start", ""))
+        self._changed = True
+        err.update("")
+        inp.value = ""
+        self.query_one("#busy-list", Static).update(self._list_markup())
 
 
 class Confirm(ModalScreen):
@@ -381,9 +580,23 @@ class LsfApp(App):
     }
     #task-table { height: 1fr; }
 
-    TaskForm, LogTimeForm, Confirm, PanicScreen { align: center middle; }
+    TaskForm, LogTimeForm, SubtaskScreen, BusyScreen, Confirm, PanicScreen {
+        align: center middle;
+    }
+    #subs-box {
+        width: 64; height: auto; max-height: 80%; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #subs-scroll { height: auto; max-height: 14; }
+    #subs-box Input { margin-top: 1; }
+    #busy-box {
+        width: 64; height: auto; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #busy-box Input { margin-top: 1; }
     #form-box {
-        width: 60; height: auto; padding: 1 2;
+        width: 60; height: auto; max-height: 90%; overflow-y: auto;
+        padding: 1 2;
         border: thick $primary; background: $surface;
     }
     #form-box Input { margin-bottom: 1; }
@@ -413,6 +626,8 @@ class LsfApp(App):
         Binding("u", "undo", "Undo"),
         Binding("s", "toggle_timer", "Start/stop"),
         Binding("l", "log_time", "Log time"),
+        Binding("t", "tick_subtask", "Parts"),
+        Binding("b", "busy_blocks", "Busy"),
         Binding("p", "toggle_pause", "Pause/resume"),
         Binding("x", "export_ics", "Export .ics"),
         Binding("P", "panic", "Panic", key_display="shift+p"),
@@ -467,6 +682,9 @@ class LsfApp(App):
 
     def refresh_schedule(self) -> None:
         now = datetime.now()
+        # A recurring task's period may lap while the TUI sits open overnight
+        if roll_recurring(self.raw, now):
+            save_tasks(self.raw)
         self.tasks = [dict_to_task(d) for d in self.raw]
         if self.tasks:
             self.slices, _ = schedule_sliced(
@@ -574,6 +792,14 @@ class LsfApp(App):
                     prev_end = end
                 lines.append("")
 
+        # One-off busy periods on the displayed day
+        busy_today = busy_blocks_for_day(day_start.date())
+        if busy_today:
+            for bs, be, bname in busy_today:
+                lines.append(f"[magenta]busy[/] [dim]{bs:%H:%M}-{be:%H:%M}  "
+                             f"{escape(bname)}[/]")
+            lines.append("")
+
         # Days beyond today, condensed
         future = [s for s in self.slices if s not in day_slices]
         if future:
@@ -596,9 +822,15 @@ class LsfApp(App):
             due_label = ("today" if t.due.date() == now.date() else
                          "tmrw" if t.due.date() == (now + timedelta(days=1)).date()
                          else t.due.strftime("%a %d"))
+            name_cell = escape(t.name)
+            done_n, total = t.subtask_counts()
+            if total:
+                name_cell += f" [dim]{done_n}/{total}[/]"
+            if t.recur:
+                name_cell += f" [cyan]({t.recur})[/]"
             table.add_row(
                 str(i),
-                escape(t.name),
+                name_cell,
                 DIFF_ICON.get(t.difficulty, "~"),
                 "*" * t.priority,
                 f"{due_label} {t.due:%H:%M}",
@@ -618,8 +850,19 @@ class LsfApp(App):
             return
         spent = (f"  [dim]({fmt_hours(t.time_spent)} spent)[/]"
                  if t.time_spent > 0 else "")
+        recur_tag = f"  [cyan]repeats {t.recur}[/]" if t.recur else ""
+        parts_line = ""
+        if t.subtasks:
+            done_n, total = t.subtask_counts()
+            parts_line = f"\nParts {done_n}/{total}"
+            nxt = t.next_subtask()
+            if nxt:
+                parts_line += f"  ·  next: [bold]{escape(nxt)}[/]"
+                if t.ordered:
+                    parts_line += "  [dim](in order)[/]"
+            parts_line += "  [dim]· t to tick[/]"
         panel.update(
-            f"[bold]{escape(t.name)}[/]  [dim][{t.id}][/]\n"
+            f"[bold]{escape(t.name)}[/]  [dim][{t.id}][/]{recur_tag}\n"
             f"Due {fmt_dt(t.due)}  ·  "
             f"est {fmt_hours(t.raw_estimate)} -> "
             f"{fmt_hours(t.adjusted_estimate)} adjusted{spent}\n"
@@ -628,6 +871,7 @@ class LsfApp(App):
             f"{_slack_bar_markup(t.slack, t.adjusted_estimate)}\n"
             f"Finish ~{fmt_dt(t.finish_time)}  ·  "
             f"{_status_markup(t, self.collectively_overloaded)}"
+            f"{parts_line}"
         )
 
     def render_stats(self, now: datetime, total_remaining: float,
@@ -795,22 +1039,72 @@ class LsfApp(App):
                 clear_session()
                 mark_session_end(datetime.now())
             d = self.raw_for(t)
-            if d is not None:
-                archive_task(d)
-            self.raw = [x for x in self.raw if x["id"] != t.id]
-            self.persist()
-            self.notify(f"Done: {t.name}  (u to undo)")
-        self.push_screen(Confirm(f"Mark [bold]{escape(t.name)}[/] as done?\n"
-                                 f"[dim]Archived to history -- u undoes.[/]"), done)
+            nxt = complete_task_dict(d, datetime.now()) if d is not None else None
+            if nxt is not None:
+                self.raw = [nxt if x["id"] == t.id else x for x in self.raw]
+                self.persist()
+                self.notify(f"Done: {t.name} -- repeats {nxt['recur']}, next "
+                            f"due {fmt_dt(datetime.fromisoformat(nxt['due']))}")
+            else:
+                self.raw = [x for x in self.raw if x["id"] != t.id]
+                self.persist()
+                self.notify(f"Done: {t.name}  (u to undo)")
+        extra = (f"\n[dim]Repeats {t.recur} -- it will reset for the "
+                 f"next period.[/]" if t.recur
+                 else "\n[dim]Archived to history -- u undoes.[/]")
+        self.push_screen(Confirm(f"Mark [bold]{escape(t.name)}[/] as done?"
+                                 f"{extra}"), done)
 
     def action_undo(self) -> None:
         entry = pop_history()
         if entry is None:
             self.notify("Nothing to undo.", severity="warning")
             return
-        self.raw.append(entry)
+        restore_history_entry(self.raw, entry)
         self.persist()
         self.notify(f"Restored: {entry['name']}")
+
+    def action_tick_subtask(self) -> None:
+        t = self.selected_task()
+        if t is None:
+            self.notify("No task selected.", severity="warning")
+            return
+        d = self.raw_for(t)
+        if d is None:
+            return
+        if not d.get("subtasks"):
+            self.notify("No subtasks on this task -- press e to add some "
+                        "(e.g. 'Chapter 1..11').", severity="warning")
+            return
+
+        def done(res) -> None:
+            if res is None:
+                return
+            subs, newly_done = res
+            d["subtasks"] = subs
+            if newly_done:
+                # The finished part absorbs the running time counter, so an
+                # overrun there never eats into the remaining parts' estimates.
+                d["time_spent"] = 0.0
+            self.persist()
+            done_n = sum(1 for s in subs if s.get("done"))
+            if done_n == len(subs):
+                self.notify(f"{d['name']}: all {len(subs)} parts done -- "
+                            f"press d to complete the task!")
+            else:
+                self.notify(f"{d['name']}: {done_n}/{len(subs)} parts done")
+        self.push_screen(
+            SubtaskScreen(t.name, d["subtasks"], bool(d.get("ordered"))), done)
+
+    def action_busy_blocks(self) -> None:
+        def done(blocks) -> None:
+            if blocks is None:
+                return
+            save_busy(blocks)
+            self.refresh_schedule()
+            self.notify(f"{len(blocks)} busy period(s) -- "
+                        f"schedule adjusted around them")
+        self.push_screen(BusyScreen(load_busy()), done)
 
     def action_log_time(self) -> None:
         t = self.selected_task()

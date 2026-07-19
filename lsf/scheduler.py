@@ -17,9 +17,11 @@ from .task import (
     RISK_MULTIPLIER, SWITCH_PENALTY_H, EPSILON,
     SLICE_H, SWITCH_URGENCY_PENALTY, BREAK_H, URGENCY_SLACK_FLOOR,
     _remaining_in_window,
+    set_busy_blocks, busy_blocks_for_day,
 )
 from .util import (
-    prompt, parse_due_date, parse_duration,
+    prompt, parse_due_date, parse_duration, parse_busy_block,
+    parse_subtasks, fmt_subtasks,
     fmt_hours, fmt_dt, slack_bar,
 )
 
@@ -49,6 +51,7 @@ CSV_FILE         = os.path.join(DATA_DIR, "import.csv")
 SESSION_FILE     = os.path.join(DATA_DIR, "session.json")
 HISTORY_FILE     = os.path.join(DATA_DIR, "done.json")
 STATE_FILE       = os.path.join(DATA_DIR, "state.json")
+BUSY_FILE        = os.path.join(DATA_DIR, "busy.json")
 DEFAULT_ICS_PATH = os.path.join(os.path.expanduser("~"), "lsf_schedule.ics")
 
 PRIORITY_LABELS = {
@@ -81,16 +84,120 @@ def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
+# -- One-off busy blocks (no-work periods) ------------------------------------
+
+def load_busy() -> list[dict]:
+    """Read busy blocks, prune ones more than a day in the past, and install
+    them into the working-hours math. Returns the current block list."""
+    blocks: list[dict] = []
+    if os.path.exists(BUSY_FILE):
+        try:
+            with open(BUSY_FILE, "r", encoding="utf-8") as f:
+                blocks = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            blocks = []
+    cutoff = datetime.now() - timedelta(days=1)
+    kept = []
+    for b in blocks:
+        try:
+            if datetime.fromisoformat(b["end"]) > cutoff:
+                kept.append(b)
+        except (KeyError, ValueError):
+            continue
+    if len(kept) != len(blocks):
+        save_busy(kept)
+    else:
+        set_busy_blocks(kept)
+    return kept
+
+
+def save_busy(blocks: list[dict]):
+    """Persist busy blocks and install them into the working-hours math."""
+    ensure_data_dir()
+    blocks = sorted(blocks, key=lambda b: b.get("start", ""))
+    with open(BUSY_FILE, "w", encoding="utf-8") as f:
+        json.dump(blocks, f, indent=2)
+    set_busy_blocks(blocks)
+
+
+# -- Recurring tasks ----------------------------------------------------------
+
+RECUR_PERIODS = {"daily": timedelta(days=1), "weekly": timedelta(weeks=1)}
+
+
+def roll_recurring(raw: list[dict], now: datetime) -> bool:
+    """Silently move overdue recurring tasks into the current period.
+
+    A missed day/week is simply skipped -- the user may just have forgotten
+    to hit done, so the task reappears fresh (progress reset) with the next
+    upcoming due date, never as 'late'. Returns True if anything changed.
+    """
+    changed = False
+    for d in raw:
+        period = RECUR_PERIODS.get(d.get("recur"))
+        if period is None:
+            continue
+        try:
+            due = datetime.fromisoformat(d["due"])
+        except (KeyError, ValueError):
+            continue
+        if due >= now:
+            continue
+        while due < now:
+            due += period
+        d["due"]        = due.isoformat()
+        d["time_spent"] = 0.0
+        for s in d.get("subtasks") or []:
+            s["done"] = False
+        changed = True
+    return changed
+
+
+def complete_task_dict(d: dict, now: datetime) -> dict | None:
+    """Archive d as completed. For recurring tasks, return the reset record
+    for the next period (the caller replaces d with it); None means the task
+    is one-off and should be removed from the active list."""
+    archive_task(d)
+    period = RECUR_PERIODS.get(d.get("recur"))
+    if period is None:
+        return None
+    nxt = dict(d)
+    due = datetime.fromisoformat(d["due"]) + period
+    while due <= now:
+        due += period
+    nxt["due"]        = due.isoformat()
+    nxt["time_spent"] = 0.0
+    if nxt.get("subtasks"):
+        nxt["subtasks"] = [{**s, "done": False} for s in nxt["subtasks"]]
+    return nxt
+
+
+def restore_history_entry(raw: list[dict], entry: dict) -> None:
+    """Undo a completion: recurring tasks still exist in the active list
+    (reset for the next period), so restore by replacing that record;
+    one-off tasks are simply re-appended."""
+    if entry.get("recur"):
+        for i, d in enumerate(raw):
+            if d["id"] == entry["id"]:
+                raw[i] = entry
+                return
+    raw.append(entry)
+
+
 def load_tasks() -> list[dict]:
     ensure_data_dir()
+    load_busy()   # keep the working-hours math in sync with busy.json
     if not os.path.exists(DATA_FILE):
         return []
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f)
     except (json.JSONDecodeError, IOError):
         print(f"  {YELLOW}Warning: could not read {DATA_FILE}, starting fresh.{RESET}")
         return []
+    if roll_recurring(raw, datetime.now()):
+        save_tasks(raw)
+    return raw
 
 
 def save_tasks(tasks: list[dict]):
@@ -197,7 +304,9 @@ def pop_history() -> dict | None:
 
 
 def new_task_dict(name: str, due: str, raw_estimate: float,
-                  priority: int, difficulty: int = 2) -> dict:
+                  priority: int, difficulty: int = 2,
+                  subtasks: list[dict] | None = None, ordered: bool = False,
+                  recur: str | None = None) -> dict:
     """Build a fresh task record (due is an ISO datetime string)."""
     return {
         "id":           str(uuid.uuid4())[:8],
@@ -207,6 +316,9 @@ def new_task_dict(name: str, due: str, raw_estimate: float,
         "priority":     priority,
         "difficulty":   difficulty,
         "time_spent":   0.0,
+        "subtasks":     subtasks or [],
+        "ordered":      bool(ordered),
+        "recur":        recur,
     }
 
 
@@ -326,6 +438,9 @@ def dict_to_task(d: dict) -> "Task":
         priority   = d["priority"],
         task_id    = d["id"],
         difficulty = d.get("difficulty", 2),
+        subtasks   = d.get("subtasks") or [],
+        ordered    = bool(d.get("ordered")),
+        recur      = d.get("recur"),
     )
     t.time_spent = d.get("time_spent", 0.0)
     return t
@@ -340,6 +455,9 @@ def task_to_dict(t: "Task") -> dict:
         "priority":     t.priority,
         "difficulty":   t.difficulty,
         "time_spent":   t.time_spent,
+        "subtasks":     t.subtasks,
+        "ordered":      t.ordered,
+        "recur":        t.recur,
     }
 
 
@@ -689,13 +807,23 @@ def update_session(tasks: list[Task]) -> tuple[list[Task], bool]:
             except ValueError:
                 pass
         if done_indices:
-            removed = [tasks[i] for i in sorted(done_indices)]
-            tasks   = [t for i, t in enumerate(tasks) if i not in done_indices]
+            now_c = datetime.now()
+            kept: list[Task] = []
             print()
-            for t in removed:
-                archive_task(task_to_dict(t))
-                print(f"  {GREEN}[x] Done: {t.name}{RESET}  "
-                      f"{DIM}(archived -- 'lsf undo' restores){RESET}")
+            for i, t in enumerate(tasks):
+                if i not in done_indices:
+                    kept.append(t)
+                    continue
+                nxt = complete_task_dict(task_to_dict(t), now_c)
+                if nxt is None:
+                    print(f"  {GREEN}[x] Done: {t.name}{RESET}  "
+                          f"{DIM}(archived -- 'lsf undo' restores){RESET}")
+                else:
+                    kept.append(dict_to_task(nxt))
+                    print(f"  {GREEN}[x] Done: {t.name}{RESET}  "
+                          f"{DIM}(repeats {t.recur} -- next due "
+                          f"{fmt_dt(datetime.fromisoformat(nxt['due']))}){RESET}")
+            tasks   = kept
             changed = True
 
     print()
@@ -969,7 +1097,7 @@ def main():
         "command", nargs="?", default="tui",
         choices=["tui", "schedule", "panic", "import", "start", "done",
                  "edit", "pause", "resume", "export", "add", "undo",
-                 "history"],
+                 "history", "busy"],
         help=(
             "tui (default) -- full-screen interface; "
             "schedule -- classic prompt-based schedule; "
@@ -983,7 +1111,10 @@ def main():
             "export -- write schedule to an .ics calendar file; "
             "add -- add a task non-interactively (lsf add \"Name\" --est 2h); "
             "undo -- restore the most recently completed task; "
-            "history -- show completed tasks with estimated vs actual time"
+            "history -- show completed tasks with estimated vs actual time; "
+            "busy -- list one-off no-work periods, add one "
+            "(lsf busy \"thursday 14:00-16:00 meeting\"), "
+            "or delete by number (lsf busy 2)"
         )
     )
     parser.add_argument(
@@ -1007,6 +1138,20 @@ def main():
     parser.add_argument(
         "-d", "--difficulty", type=int, default=2, metavar="1-3",
         help="difficulty for 'add' (1 light, 2 medium, 3 deep, default 2)"
+    )
+    parser.add_argument(
+        "--subtasks", default=None, metavar="SPEC",
+        help="subtasks for 'add' (e.g. \"Chapter 1..11\" or "
+             "\"intro, body*3, end*2\"; weight after '*')"
+    )
+    parser.add_argument(
+        "--ordered", action="store_true",
+        help="subtasks must be completed in order (with --subtasks)"
+    )
+    parser.add_argument(
+        "--recur", choices=["daily", "weekly"], default=None,
+        help="repeat the task every day/week; completing it resets it for "
+             "the next period, missed periods are skipped silently"
     )
     parser.add_argument(
         "--next", action="store_true",
@@ -1248,14 +1393,26 @@ def main():
         if args.difficulty not in DIFFICULTY_LABELS:
             print(f"  {RED}Difficulty must be 1-3.{RESET}")
             return
+        try:
+            subtasks = parse_subtasks(args.subtasks) if args.subtasks else []
+        except ValueError as e:
+            print(f"  {RED}{e}{RESET}")
+            return
         raw_a = load_tasks()
         raw_a.append(new_task_dict(args.file.strip(), due.isoformat(),
-                                   estimate, args.priority, args.difficulty))
+                                   estimate, args.priority, args.difficulty,
+                                   subtasks=subtasks, ordered=args.ordered,
+                                   recur=args.recur))
         save_tasks(raw_a)
         stars = '*' * args.priority
+        extras = ""
+        if subtasks:
+            extras += f"  {len(subtasks)} parts" + (" (in order)" if args.ordered else "")
+        if args.recur:
+            extras += f"  repeats {args.recur}"
         print(f"  {GREEN}[x] Added: {args.file.strip()}{RESET}  "
               f"{DIM}{DIFF_ICON.get(args.difficulty, '~')} {stars}  "
-              f"due {fmt_dt(due)}  est {fmt_hours(estimate)}{RESET}")
+              f"due {fmt_dt(due)}  est {fmt_hours(estimate)}{extras}{RESET}")
         return
 
     # -- lsf undo -----------------------------------------------------
@@ -1266,7 +1423,7 @@ def main():
                   f"the archive.{RESET}")
             return
         raw_u = load_tasks()
-        raw_u.append(entry)
+        restore_history_entry(raw_u, entry)
         save_tasks(raw_u)
         print(f"  {GREEN}[x] Restored: {entry['name']}{RESET}  "
               f"{DIM}(due {fmt_dt(datetime.fromisoformat(entry['due']))}){RESET}")
@@ -1299,6 +1456,48 @@ def main():
                   f"{DIM}finished {when}{RESET}  ·  {vs}")
         if len(history) > 20:
             print(f"  {DIM}... +{len(history) - 20} older{RESET}")
+        print()
+        return
+
+    # -- lsf busy [spec | number] -------------------------------------
+    if args.command == "busy":
+        blocks = load_busy()
+        arg    = (args.file or "").strip()
+        if arg and arg.isdigit():
+            n = int(arg)
+            if not (1 <= n <= len(blocks)):
+                print(f"  {RED}No busy block #{n}. You have {len(blocks)}.{RESET}")
+                return
+            gone = blocks.pop(n - 1)
+            save_busy(blocks)
+            print(f"  {GREEN}[x] Removed: {gone.get('name', 'busy')}{RESET}")
+            return
+        if arg:
+            try:
+                block = parse_busy_block(arg)
+            except ValueError as e:
+                print(f"  {RED}{e}{RESET}")
+                return
+            blocks.append(block)
+            save_busy(blocks)
+            s_b = datetime.fromisoformat(block["start"])
+            e_b = datetime.fromisoformat(block["end"])
+            print(f"  {GREEN}[x] Busy: {block['name']}  "
+                  f"{fmt_dt(s_b)} - {e_b:%H:%M}{RESET}  "
+                  f"{DIM}(working hours around it adjust automatically){RESET}")
+            return
+        if not blocks:
+            print(f"  {DIM}No busy blocks. Add one with e.g. "
+                  f"lsf busy \"thursday 14:00-16:00 meeting\"{RESET}")
+            return
+        print()
+        print(f"  {BOLD}One-off busy periods{RESET}  "
+              f"{DIM}(lsf busy <number> deletes){RESET}")
+        for i, b in enumerate(blocks, 1):
+            s_b = datetime.fromisoformat(b["start"])
+            e_b = datetime.fromisoformat(b["end"])
+            print(f"    {CYAN}{i}.{RESET} {fmt_dt(s_b)} - {e_b:%H:%M}  "
+                  f"{b.get('name', 'busy')}")
         print()
         return
 
@@ -1501,6 +1700,9 @@ def main():
                 "overloaded":           t.overloaded,
                 "will_be_late":         t.will_be_late,
                 "finish_time":          t.finish_time.isoformat(),
+                "subtasks":             t.subtasks,
+                "ordered":              t.ordered,
+                "recur":                t.recur,
             }
         def _slice_json(s) -> dict:
             return {
@@ -1535,6 +1737,7 @@ def main():
             "active_session": active_info,
             "tasks":          [_task_json(t) for t in ordered],
             "slices":         [_slice_json(s) for s in slices],
+            "busy_blocks":    load_busy(),
             "summary": {
                 "task_count":        len(ordered),
                 "slice_count":       len(slices),

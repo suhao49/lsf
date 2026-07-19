@@ -3,7 +3,7 @@ lsf.util -- input parsers and display formatters.
 """
 
 import re
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dtime
 
 RED    = "\033[91m"
 YELLOW = "\033[93m"
@@ -136,6 +136,117 @@ def parse_duration(raw: str) -> float:
         return float(raw[:-1]) / 60
     else:
         return float(raw)
+
+
+_TIME_RANGE_RE = re.compile(
+    r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*-\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?")
+
+
+def _clock(h: str, m: str | None, ampm: str | None) -> dtime:
+    hh, mm = int(h), int(m or 0)
+    if ampm == "pm" and hh != 12:
+        hh += 12
+    elif ampm == "am" and hh == 12:
+        hh = 0
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ValueError(f"invalid time '{h}:{m or '00'}'")
+    return dtime(hh, mm)
+
+
+def parse_time_range(raw: str) -> tuple[dtime, dtime]:
+    """Parse '14:00-16:00', '2-4pm', '2:30pm-4pm', '9-11am' into (start, end)."""
+    m = _TIME_RANGE_RE.fullmatch(raw.strip().lower())
+    if not m:
+        raise ValueError(f"not a time range: '{raw}'")
+    h1, m1, ap1, h2, m2, ap2 = m.groups()
+    if ap1 is None and ap2 is not None and int(h1) <= 12:
+        ap1 = ap2                      # '2-4pm' -> both pm
+    start, end = _clock(h1, m1, ap1), _clock(h2, m2, ap2)
+    if end <= start:
+        raise ValueError(f"range end must be after start: '{raw}'")
+    return start, end
+
+
+def parse_busy_block(raw: str) -> dict:
+    """
+    Parse a one-off no-work period: '[day] <start>-<end> [label]'.
+        thursday 14:00-16:00 team meeting
+        2-4pm dentist                      (day defaults to today)
+        25/03 9am-12pm open day
+    Returns {"start": iso, "end": iso, "name": label}.
+    """
+    rng, span = None, None
+    for m in _TIME_RANGE_RE.finditer(raw.lower()):
+        try:
+            rng  = parse_time_range(m.group(0))
+            span = m.span()
+            break
+        except ValueError:
+            continue                     # e.g. '26-03' inside an ISO date
+    if rng is None:
+        raise ValueError(
+            "No time range found -- expected e.g. 'thursday 14:00-16:00 meeting'")
+    day_spec = raw[:span[0]].strip()
+    label    = raw[span[1]:].strip() or "busy"
+    day      = parse_due_date(day_spec).date() if day_spec else date.today()
+    return {
+        "start": datetime.combine(day, rng[0]).isoformat(),
+        "end":   datetime.combine(day, rng[1]).isoformat(),
+        "name":  label,
+    }
+
+
+_SUBTASK_RANGE_RE = re.compile(r"(\d+)\s*\.\.\s*(\d+)$")
+
+
+def parse_subtasks(raw: str) -> list[dict]:
+    """
+    Parse a subtask spec into [{"name", "weight", "done"}].
+        'Chapter 1..11'            -> 11 subtasks, weight 1 each
+        'intro, body*3, end*2'     -> weights after '*'
+        'Ch 1..3*2'                -> range expansion, each with weight 2
+    Empty input returns [].
+    """
+    items: list[dict] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        weight = 1.0
+        name   = part
+        if "*" in part:
+            head, _, tail = part.rpartition("*")
+            try:
+                weight = float(tail.strip())
+                name   = head.strip()
+            except ValueError:
+                pass                     # '*' is part of the name
+        if weight <= 0:
+            raise ValueError(f"subtask weight must be positive: '{part}'")
+        if not name:
+            raise ValueError(f"subtask has no name: '{part}'")
+        m = _SUBTASK_RANGE_RE.search(name)
+        if m and int(m.group(1)) <= int(m.group(2)):
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if hi - lo >= 200:
+                raise ValueError(f"subtask range too large: '{name}'")
+            prefix = name[:m.start()].rstrip()
+            for i in range(lo, hi + 1):
+                items.append({"name": f"{prefix} {i}".strip() if prefix else str(i),
+                              "weight": weight, "done": False})
+        else:
+            items.append({"name": name, "weight": weight, "done": False})
+    return items
+
+
+def fmt_subtasks(subs: list[dict]) -> str:
+    """Serialize subtasks back into the parse_subtasks() syntax (loses done flags)."""
+    parts = []
+    for s in subs:
+        w = float(s.get("weight", 1.0))
+        w_str = "" if w == 1.0 else f"*{w:g}"
+        parts.append(f"{s['name']}{w_str}")
+    return ", ".join(parts)
 
 
 def fmt_hours(h: float) -> str:
