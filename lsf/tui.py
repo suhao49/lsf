@@ -174,6 +174,63 @@ class TaskForm(ModalScreen):
         })
 
 
+class LogTimeForm(ModalScreen):
+    """Manually log time on a task. Dismisses with the new total hours,
+    or None on cancel."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, task_name: str, current_h: float):
+        super().__init__()
+        self._task_name = task_name
+        self._current_h = current_h
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="log-box"):
+            yield Label(f"[bold]Log time -- {escape(self._task_name)}[/]",
+                        id="log-title")
+            yield Label(f"[dim]Currently logged: {fmt_hours(self._current_h)}[/]")
+            yield Label("Time  [dim](1h30m adds · -30m removes · =2h sets total)[/]")
+            yield Input(placeholder="45m", id="log-input")
+            yield Label("", id="log-error")
+            with Horizontal(id="log-buttons"):
+                yield Button("Log", variant="success", id="log-save")
+                yield Button("Cancel", id="log-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#log-input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#log-cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Input.Submitted)
+    @on(Button.Pressed, "#log-save")
+    def _save(self) -> None:
+        err = self.query_one("#log-error", Label)
+        raw = self.query_one("#log-input", Input).value.strip()
+        if not raw.lstrip("=-").strip():
+            err.update("[red]Enter a time (try 45m, 1h30m, =2h).[/]")
+            return
+        try:
+            if raw.startswith("="):
+                total = parse_duration(raw[1:].strip())
+            elif raw.startswith("-"):
+                total = self._current_h - parse_duration(raw[1:].strip())
+            else:
+                total = self._current_h + parse_duration(raw)
+        except ValueError:
+            err.update("[red]Could not parse time (try 45m, 1h30m, =2h).[/]")
+            return
+        if total < 0:
+            err.update("[red]Total logged time cannot go below 0.[/]")
+            return
+        self.dismiss(total)
+
+
 class Confirm(ModalScreen):
     """Yes/No confirmation. Dismisses with True/False."""
 
@@ -324,13 +381,19 @@ class LsfApp(App):
     }
     #task-table { height: 1fr; }
 
-    TaskForm, Confirm, PanicScreen { align: center middle; }
+    TaskForm, LogTimeForm, Confirm, PanicScreen { align: center middle; }
     #form-box {
         width: 60; height: auto; padding: 1 2;
         border: thick $primary; background: $surface;
     }
     #form-box Input { margin-bottom: 1; }
     #form-buttons Button { margin-right: 2; }
+    #log-box {
+        width: 54; height: auto; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #log-box Input { margin-bottom: 1; }
+    #log-buttons Button { margin-right: 2; }
     #confirm-box {
         width: 50; height: auto; padding: 1 2;
         border: thick $error; background: $surface;
@@ -349,6 +412,7 @@ class LsfApp(App):
         Binding("d", "complete_task", "Done"),
         Binding("u", "undo", "Undo"),
         Binding("s", "toggle_timer", "Start/stop"),
+        Binding("l", "log_time", "Log time"),
         Binding("p", "toggle_pause", "Pause/resume"),
         Binding("x", "export_ics", "Export .ics"),
         Binding("P", "panic", "Panic", key_display="shift+p"),
@@ -747,6 +811,25 @@ class LsfApp(App):
         self.raw.append(entry)
         self.persist()
         self.notify(f"Restored: {entry['name']}")
+
+    def action_log_time(self) -> None:
+        t = self.selected_task()
+        if t is None:
+            self.notify("No task selected.", severity="warning")
+            return
+        d = self.raw_for(t)
+        if d is None:
+            return
+
+        def done(new_total: float | None) -> None:
+            if new_total is None:
+                return
+            # No mark_session_end here: manual logging is retroactive
+            # bookkeeping, so it shouldn't trigger a break shift.
+            d["time_spent"] = round(new_total, 4)
+            self.persist()
+            self.notify(f"{d['name']}: {fmt_hours(new_total)} logged total")
+        self.push_screen(LogTimeForm(t.name, d.get("time_spent", 0.0)), done)
 
     def action_toggle_timer(self) -> None:
         session = load_session()

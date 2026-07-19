@@ -150,7 +150,13 @@ Running `lsf` with no arguments opens the full-screen terminal interface:
 ```
 
 Keys: `a` add task · `e` edit · `d` mark done · `u` undo · `s` start/stop timer ·
-`p` pause/resume · `x` export .ics · `shift+p` panic triage · `r` reload · `q` quit.
+`l` log time manually · `p` pause/resume · `x` export .ics · `shift+p` panic triage ·
+`r` reload · `q` quit.
+
+`l` logs time on the selected task without running a timer — useful for work
+you did away from the computer or forgot to time. Enter `1h30m` to add,
+`-30m` to remove, or `=2h` to set the total. Manual logging never triggers
+the post-session break, since the work already happened.
 
 While a timer is running the TUI rings the terminal bell and shows a
 notification when you have worked a full slice ("time for a break") and when
