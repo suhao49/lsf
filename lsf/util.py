@@ -57,6 +57,21 @@ def parse_due_date(raw: str) -> datetime:
     if raw in ("tonight", "eod", "end of day"):
         return now.replace(hour=22, minute=0, second=0, microsecond=0)
 
+    # Bare time: '21:00', '9pm', '9:30pm' -> today at that time,
+    # or tomorrow if it has already passed (useful for recurring tasks).
+    m_t = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(am|pm)?", raw)
+    if m_t and (m_t.group(2) is not None or m_t.group(3)):  # bare '21' is too ambiguous
+        h, mnt, ap = int(m_t.group(1)), int(m_t.group(2) or 0), m_t.group(3)
+        if ap == "pm" and h != 12:
+            h += 12
+        elif ap == "am" and h == 12:
+            h = 0
+        if 0 <= h <= 23 and 0 <= mnt <= 59:
+            result = now.replace(hour=h, minute=mnt, second=0, microsecond=0)
+            if result <= now:
+                result += timedelta(days=1)
+            return result
+
     tokens = raw.split()
 
     if tokens and tokens[0] in ("today", "tomorrow"):

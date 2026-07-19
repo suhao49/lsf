@@ -1383,7 +1383,9 @@ def main():
             print(f"  {RED}Could not parse estimate '{args.est}'.{RESET}")
             return
         try:
-            due = parse_due_date(args.due or "tomorrow 23:59")
+            # Repeating tasks default to today -- the recurrence rolls it on
+            default_due = "today 23:59" if args.recur else "tomorrow 23:59"
+            due = parse_due_date(args.due or default_due)
         except ValueError as e:
             print(f"  {RED}{e}{RESET}")
             return

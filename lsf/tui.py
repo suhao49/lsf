@@ -17,6 +17,7 @@ renders state and forwards edits back through the same persistence helpers
 the CLI commands use, so `lsf start` / `lsf done` etc. stay interoperable.
 """
 
+import re
 from datetime import datetime, timedelta
 
 from rich.markup import escape
@@ -102,7 +103,8 @@ class TaskForm(ModalScreen):
             yield Label(f"[bold]{title}[/]", id="form-title")
             yield Label("Name")
             yield Input(value=t["name"] if t else "", id="f-name")
-            yield Label("Due  [dim](e.g. 25/03 23:59, friday 18:00, +3d, tonight)[/]")
+            yield Label("Due  [dim]e.g. 25/03 23:59, friday 18:00, +3d, tonight · "
+                        "repeating tasks: blank = today, or just a time like 21:00[/]")
             yield Input(
                 value=fmt_dt(datetime.fromisoformat(t["due"])) if t else "",
                 placeholder="tomorrow 23:59", id="f-due")
@@ -144,9 +146,21 @@ class TaskForm(ModalScreen):
             err.update("[red]Name cannot be empty.[/]")
             return
 
+        rep = self.query_one("#f-rep", Input).value.strip().lower()
+        recur = {"": None, "d": "daily", "daily": "daily",
+                 "w": "weekly", "weekly": "weekly"}.get(rep, "?")
+        if recur == "?":
+            err.update("[red]Repeat must be blank, daily, or weekly.[/]")
+            return
+
         raw_due = self.query_one("#f-due", Input).value.strip()
         try:
-            if self._task_dict and raw_due == fmt_dt(datetime.fromisoformat(self._task_dict["due"])):
+            if not raw_due and recur:
+                # Repeating tasks don't need a date -- default to end of today;
+                # the recurrence keeps it rolling from there.
+                due = datetime.now().replace(hour=23, minute=59, second=0,
+                                             microsecond=0)
+            elif self._task_dict and raw_due == fmt_dt(datetime.fromisoformat(self._task_dict["due"])):
                 due = datetime.fromisoformat(self._task_dict["due"])
             else:
                 due = parse_due_date(raw_due)
@@ -194,13 +208,6 @@ class TaskForm(ModalScreen):
 
         ordered = self.query_one("#f-ord", Input).value.strip().lower() in (
             "y", "yes", "true", "1")
-
-        rep = self.query_one("#f-rep", Input).value.strip().lower()
-        recur = {"": None, "d": "daily", "daily": "daily",
-                 "w": "weekly", "weekly": "weekly"}.get(rep, "?")
-        if recur == "?":
-            err.update("[red]Repeat must be blank, daily, or weekly.[/]")
-            return
 
         self.dismiss({
             "name":         name,
@@ -293,8 +300,10 @@ class SubtaskScreen(ModalScreen):
                 yield Static(self._list_markup(), id="subs-list")
             hint = ("must be done in order" if self._ordered else "any order")
             yield Label(f"[dim]Number = tick/untick ({hint}) · "
+                        f"3*2 = give part 3 twice the time share · "
                         f"Enter on empty or Esc closes[/]")
-            yield Input(placeholder="part number", id="subs-input")
+            yield Input(placeholder="part number, or e.g. 3*2 to set a weight",
+                        id="subs-input")
             yield Label("", id="subs-error")
 
     def on_mount(self) -> None:
@@ -304,16 +313,19 @@ class SubtaskScreen(ModalScreen):
         total_w = sum(max(float(s.get("weight", 1.0)), 0.0)
                       for s in self._subs) or 1.0
         lines, next_marked = [], False
+        any_weighted = any(float(s.get("weight", 1.0)) != 1.0 for s in self._subs)
         for i, s in enumerate(self._subs, 1):
             done = bool(s.get("done"))
             box  = "[green]\\[x][/]" if done else "\\[ ]"
-            pct  = max(float(s.get("weight", 1.0)), 0.0) / total_w * 100
+            w    = max(float(s.get("weight", 1.0)), 0.0)
+            pct  = w / total_w * 100
+            w_str = f"x{w:g} · " if any_weighted else ""
             mark = ""
             if not done and not next_marked:
                 mark = "  [cyan]<- next[/]"
                 next_marked = True
             lines.append(f" {i:>2}. {box} {escape(s['name'])}"
-                         f"  [dim]{pct:.0f}%[/]{mark}")
+                         f"  [dim]{w_str}{pct:.0f}%[/]{mark}")
         return "\n".join(lines) or "[dim]No subtasks.[/]"
 
     def _result(self):
@@ -330,12 +342,29 @@ class SubtaskScreen(ModalScreen):
         if not raw:
             self.dismiss(self._result())
             return
+        # 'N*W' -> set part N's weight (time share) to W
+        m = re.fullmatch(r"(\d+)\s*\*\s*(\d+(?:\.\d+)?)", raw)
+        if m:
+            idx, w = int(m.group(1)), float(m.group(2))
+            if not (1 <= idx <= len(self._subs)):
+                err.update(f"[red]Enter a number 1-{len(self._subs)}.[/]")
+                return
+            if w <= 0:
+                err.update("[red]Weight must be positive.[/]")
+                return
+            self._subs[idx - 1]["weight"] = w
+            self._changed = True
+            err.update("")
+            inp.value = ""
+            self.query_one("#subs-list", Static).update(self._list_markup())
+            return
         try:
             idx = int(raw)
             if not (1 <= idx <= len(self._subs)):
                 raise ValueError
         except ValueError:
-            err.update(f"[red]Enter a number 1-{len(self._subs)}.[/]")
+            err.update(f"[red]Enter a number 1-{len(self._subs)}, "
+                       f"or N*W to set a weight.[/]")
             return
         s = self._subs[idx - 1]
         if self._ordered:

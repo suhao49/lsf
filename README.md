@@ -174,7 +174,9 @@ A task can be split into weighted parts — in the add/edit form, fill the
 - **Subtask order** `y` means parts must be done in sequence (a textbook:
   chapter 1 before chapter 2); `n` means any order.
 
-Press `t` on the task to tick parts off. Each finished part removes its
+Press `t` on the task to tick parts off — and to adjust time shares on the
+fly: typing `3*2` there gives part 3 twice the weight of a normal part (the
+list shows each part's share as a percentage). Each finished part removes its
 weight share from the remaining estimate, and the running time counter resets
 so a slow chapter never eats into the estimates of the chapters still to do.
 The task table shows progress as `3/11`; the detail panel shows which part is
@@ -192,7 +194,10 @@ the day plan all adjust automatically. Past blocks clean themselves up.
 ### Recurring tasks
 
 Set **Repeat** to `daily` or `weekly` in the add/edit form (or
-`lsf add "Anki" --est 30m --due tonight --recur daily`). Completing a
+`lsf add "Anki" --est 30m --recur daily`). Repeating tasks don't need a
+date: leave **Due** blank for end of today, or give just a time (`21:00`,
+`9pm`) for a daily deadline, or a weekday (`sunday 20:00`) for the weekly
+one — the recurrence keeps it rolling from there. Completing a
 recurring task archives that period and resets it for the next one instead
 of deleting it. If a period passes without you hitting done — maybe you
 simply forgot — the task quietly moves to the current period with progress
